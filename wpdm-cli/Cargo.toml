@@ -1,0 +1,10 @@
+[package]
+name = "wpdm-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { workspace = true }
+anyhow = { workspace = true }
+wpdm-common = { workspace = true }
+tracing-subscriber = { workspace = true }

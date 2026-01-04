@@ -4,11 +4,12 @@ use wayland_client::{globals::registry_queue_init, protocol::{wl_keyboard, wl_ou
 
 use crate::image_transition::ImageTransition;
 
+#[derive(Clone)]
 pub struct Monitor {
-    layer: LayerSurface,
-    width: i32,
-    height: i32,
-    configured: bool
+    pub layer: LayerSurface,
+    pub width: i32,
+    pub height: i32,
+    pub configured: bool
 }
 
 pub struct WallpaperLayer {
@@ -38,6 +39,7 @@ impl WallpaperLayer {
 
         let pool = SlotPool::new(1, &shm)?;
         let layer_shell = LayerShell::bind(&globals, &qh)?;
+        let monitors = vec![];
 
         Ok(Self {
             transition,
@@ -49,7 +51,7 @@ impl WallpaperLayer {
             layer_shell,
             pool,
             shm,
-            monitors: vec![]
+            monitors
         })
     }
 
@@ -70,7 +72,7 @@ impl WallpaperLayer {
     ) -> anyhow::Result<()> {
         let output_info = self.output_state.info(&output).context("Failed to get output info")?;
         let monitor_name = output_info.name.context("Failed to get monitor_name")?;
-        println!("New Monitor: {}", monitor_name);
+        tracing::info!("Monitor Detected: {}", monitor_name);
         let (width, height) = output_info.logical_size.context("Failed to get monitor width and height")?;
         let surface = self.compositor_state.create_surface(qh);
         let layer = self.layer_shell.create_layer_surface(
@@ -89,13 +91,31 @@ impl WallpaperLayer {
         Ok(())
     }
 
-    fn render(&mut self, qh: &QueueHandle<Self>, surface: &WlSurface) -> anyhow::Result<()> {
-        let Some(monitor) = self.monitors.iter().find(|m| m.layer.wl_surface() == surface) else {
-            return Ok(());
-        };
+    fn get_monitor(&mut self, surface: &WlSurface, configure: bool) -> Option<Monitor> {
+        if configure {
+            let monitor = self.monitors.iter_mut()
+                .find(|m| m.layer.wl_surface() == surface)?;
+            monitor.configured = configure;
+            return Some(monitor.clone());
+        }
+        let monitor = self.monitors.iter()
+            .find(|m| m.layer.wl_surface() == surface)?;
+        Some(monitor.clone())
+    }
+
+    fn render(&mut self, qh: &QueueHandle<Self>, surface: &WlSurface, configure: bool) -> anyhow::Result<()> {
+        // tracing::info!("RENDERING FRAME");
+        let monitor = self.get_monitor(surface, configure).context("Monitor not found")?;
         if !monitor.configured {
             return Ok(())
         }
+
+        if self.transition.is_finished() {
+            monitor.layer.wl_surface().frame(qh, monitor.layer.wl_surface().clone());
+            monitor.layer.commit();
+            return Ok(())
+        }
+
         let frame = self.transition.get_frame();
 
         let width = monitor.width;
@@ -116,7 +136,6 @@ impl WallpaperLayer {
         monitor.layer.commit();
 
         Ok(())
-        
     }
 }
 
@@ -148,7 +167,7 @@ impl CompositorHandler for WallpaperLayer {
         surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
-        self.render(qh, surface).unwrap();
+        self.render(qh, surface, false).unwrap();
     }
 
     fn surface_enter(
@@ -214,10 +233,7 @@ impl LayerShellHandler for WallpaperLayer {
         _configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
-        if let Some(monitor) = self.monitors.iter_mut().find(|m| m.layer == *layer) {
-            monitor.configured = true;
-            self.render(qh, layer.wl_surface()).unwrap();
-        }
+        self.render(qh, layer.wl_surface(), true).unwrap();
     }
 }
 

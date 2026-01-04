@@ -1,0 +1,15 @@
+[package]
+name = "wpdm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+smithay-client-toolkit = { workspace = true }
+wayland-client = { workspace = true }
+image = { workspace = true }
+rayon = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+wpdm-common = { workspace = true }
+rtrb = { workspace = true }
