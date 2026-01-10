@@ -1,6 +1,8 @@
 use std::path::Path;
 
-use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator};
+use rayon::iter::{
+    IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
+};
 
 use crate::image_transition::get_velocity;
 
@@ -17,12 +19,13 @@ impl FadeInAnimation {
         Self {
             is_finished: false,
             velocity,
-            frame_count: 0
+            frame_count: 0,
         }
     }
 
     pub fn frame(&mut self, curr_wp: &[u8], nxt_wp: &[u8], frame: &mut [u8], frame_count: u8) {
-        curr_wp.par_iter()
+        curr_wp
+            .par_iter()
             .zip(nxt_wp)
             .zip(self.velocity.par_iter())
             .zip(frame.par_iter_mut())
@@ -59,10 +62,10 @@ pub struct Wallpaper {
 
 impl Wallpaper {
     pub fn new() -> Self {
-        Self { 
+        Self {
             curr_wallpaper: None,
-            next_wallpaper: None, 
-            animation: None
+            next_wallpaper: None,
+            animation: None,
         }
     }
 
@@ -80,6 +83,5 @@ impl Wallpaper {
         //  3. If there is an existing transition, return frame from the existing transition and
         //     return true
         //  4. If there is no existing transition, just return false
-
     }
 }

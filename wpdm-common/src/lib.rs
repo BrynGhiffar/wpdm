@@ -1,14 +1,16 @@
-use std::{io::{Read, Write}, net::{TcpListener, TcpStream}};
-
+use std::{
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
+};
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct WpdmSetWallpaper {
-    path: String
+    pub path: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub enum WpdmMessage {
-    SetWallpaper(WpdmSetWallpaper)
+    SetWallpaper(WpdmSetWallpaper),
 }
 
 const SUCCESS: [u8; 4] = [1; 4];
@@ -21,11 +23,10 @@ impl WpdmMessage {
 }
 
 pub struct WpdmClient {
-    stream: TcpStream
+    stream: TcpStream,
 }
 
 impl WpdmClient {
-
     pub fn new(port: Option<u16>) -> anyhow::Result<Self> {
         let port = port.unwrap_or(DEFAULT_PORT);
         let host = "127.0.0.1";
@@ -35,7 +36,6 @@ impl WpdmClient {
             .inspect_err(|err| tracing::error!("Failed to connect: {}", err))?;
         Ok(Self { stream })
     }
-
 
     pub fn set_wallpaper(&mut self, path: String) -> anyhow::Result<bool> {
         let message = WpdmMessage::set_wallpaper(path);
@@ -49,11 +49,10 @@ impl WpdmClient {
 }
 
 pub struct WpdmListener {
-    listener: TcpListener
+    listener: TcpListener,
 }
 
 impl WpdmListener {
-
     pub fn new(port: Option<u16>) -> anyhow::Result<Self> {
         let port = port.unwrap_or(DEFAULT_PORT);
         let host = "0.0.0.0";
@@ -62,12 +61,11 @@ impl WpdmListener {
         tracing::info!("Listening on: {}", addr);
         // listener.set_nonblocking(true)?;
         Ok(Self { listener })
-
     }
 
     pub fn poll(&self) -> Option<WpdmMessage> {
         tracing::info!("Polling for connections");
-        let (mut stream, incoming_addr)  = self.listener.accept().ok()?;
+        let (mut stream, incoming_addr) = self.listener.accept().ok()?;
 
         tracing::info!("Connection created from: {}", incoming_addr);
         let mut bytes = Vec::new();
@@ -77,7 +75,8 @@ impl WpdmListener {
         tracing::info!("amount: {:?}", amt);
 
         let result = postcard::from_bytes(&bytes[..amt])
-            .inspect_err(|err| tracing::error!("Error when deserializing: {}", err)).ok();
+            .inspect_err(|err| tracing::error!("Error when deserializing: {}", err))
+            .ok();
 
         tracing::info!("Result is: {:?}", result);
         let _ = stream.write(&[1; 4]).ok()?;

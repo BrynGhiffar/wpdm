@@ -1,19 +1,63 @@
-use anyhow::Context;
-use smithay_client_toolkit::{compositor::{CompositorHandler, CompositorState}, delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer, delegate_registry, delegate_seat, delegate_shm, output::{OutputHandler, OutputState}, registry::{ProvidesRegistryState, RegistryState}, registry_handlers, seat::{keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers}, pointer::{PointerEvent, PointerHandler}, Capability, SeatHandler, SeatState}, shell::{wlr_layer::{Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure}, WaylandSurface}, shm::{slot::SlotPool, Shm, ShmHandler}};
-use wayland_client::{globals::registry_queue_init, protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface::{self, WlSurface}}, Connection, EventQueue, QueueHandle};
+use std::{
+    sync::{Arc, RwLock},
+};
 
-use crate::image_transition::ImageTransition;
+use anyhow::Context;
+use rayon::{iter::{IndexedParallelIterator, ParallelIterator}, slice::{ParallelSlice, ParallelSliceMut}};
+use rtrb::Consumer;
+use smithay_client_toolkit::{
+    compositor::{CompositorHandler, CompositorState},
+    delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
+    delegate_registry, delegate_seat, delegate_shm,
+    output::{OutputHandler, OutputState},
+    registry::{ProvidesRegistryState, RegistryState},
+    registry_handlers,
+    seat::{
+        Capability, SeatHandler, SeatState,
+        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers},
+        pointer::{PointerEvent, PointerHandler},
+    },
+    shell::{
+        WaylandSurface,
+        wlr_layer::{
+            Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
+            LayerSurfaceConfigure,
+        },
+    },
+    shm::{Shm, ShmHandler, slot::SlotPool},
+};
+use wayland_client::{
+    Connection, EventQueue, QueueHandle,
+    globals::registry_queue_init,
+    protocol::{
+        wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm,
+        wl_surface::{self, WlSurface},
+    },
+};
+
+use crate::listener::WpBuffer;
+
+#[derive(Clone)]
+pub struct MonitorMeta {
+    pub name: String,
+    pub width: i32,
+    pub height: i32,
+}
+
+pub type SharedMonitorMeta = Arc<RwLock<Vec<MonitorMeta>>>;
 
 #[derive(Clone)]
 pub struct Monitor {
+    pub name: String,
     pub layer: LayerSurface,
     pub width: i32,
     pub height: i32,
-    pub configured: bool
+    pub frame: Arc<Vec<u8>>,
+    pub configured: bool,
 }
 
 pub struct WallpaperLayer {
-    transition: ImageTransition,
+    cons: Consumer<WpBuffer>,
     registry_state: RegistryState,
     seat_state: SeatState,
     output_state: OutputState,
@@ -22,13 +66,12 @@ pub struct WallpaperLayer {
     compositor_state: CompositorState,
     pool: SlotPool,
     shm: Shm,
+    monitor_meta: Arc<RwLock<Vec<MonitorMeta>>>,
     monitors: Vec<Monitor>,
 }
 
 impl WallpaperLayer {
-    pub fn new(args: &[String]) -> anyhow::Result<Self> {
-
-        let transition = ImageTransition::new(args);
+    pub fn new(cons: Consumer<WpBuffer>) -> anyhow::Result<Self> {
         let conn = Connection::connect_to_env()?;
         let (globals, event_queue) = registry_queue_init::<WallpaperLayer>(&conn)?;
         let qh = event_queue.handle();
@@ -42,7 +85,7 @@ impl WallpaperLayer {
         let monitors = vec![];
 
         Ok(Self {
-            transition,
+            cons,
             compositor_state,
             registry_state: RegistryState::new(&globals),
             seat_state: SeatState::new(&globals, &qh),
@@ -51,17 +94,25 @@ impl WallpaperLayer {
             layer_shell,
             pool,
             shm,
-            monitors
+            monitor_meta: Arc::new(RwLock::new(vec![])),
+            monitors,
         })
+    }
+
+    pub fn get_monitor_meta(&self) -> SharedMonitorMeta {
+        self.monitor_meta.clone()
     }
 
     pub fn run(&mut self) -> anyhow::Result<()> {
         let Some(mut evt_queue) = self.event_queue.take() else {
-            return Ok(())
+            return Ok(());
         };
+        tracing::info!("Running Layer");
 
         loop {
-            evt_queue.dispatch_pending(self)?;
+            evt_queue.blocking_dispatch(self)?;
+            // NOTE: for some reason if I don't put this it crashes?
+            std::thread::sleep(std::time::Duration::from_millis(17));
         }
     }
 
@@ -70,53 +121,124 @@ impl WallpaperLayer {
         qh: &QueueHandle<Self>,
         output: wl_output::WlOutput,
     ) -> anyhow::Result<()> {
-        let output_info = self.output_state.info(&output).context("Failed to get output info")?;
-        let monitor_name = output_info.name.context("Failed to get monitor_name")?;
+        tracing::info!("New Monitor!");
+        let output_info = self
+            .output_state
+            .info(&output)
+            .context("Failed to get output info")?;
+        let monitor_name = output_info
+            .name
+            .context("Failed to get monitor_name")?
+            .clone();
         tracing::info!("Monitor Detected: {}", monitor_name);
-        let (width, height) = output_info.logical_size.context("Failed to get monitor width and height")?;
+        let (width, height) = output_info
+            .logical_size
+            .context("Failed to get monitor width and height")?;
         let surface = self.compositor_state.create_surface(qh);
         let layer = self.layer_shell.create_layer_surface(
             qh,
             surface,
-            Layer::Background, 
-            Some("background_layer"), 
-            Some(&output)
+            Layer::Background,
+            Some("background_layer"),
+            Some(&output),
         );
+        tracing::info!("Handle new monitor: {}", monitor_name);
         layer.set_anchor(Anchor::BOTTOM);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
         layer.set_size(width as u32, height as u32);
         layer.commit();
-        let monitor = Monitor { width, height, layer, configured: false };
+        let monitor = Monitor {
+            name: monitor_name.clone(),
+            width,
+            height,
+            layer,
+            configured: false,
+            frame: Arc::new(Vec::new()),
+        };
         self.monitors.push(monitor);
+        let mut mons = self.monitor_meta.write().unwrap();
+        mons.push(MonitorMeta {
+            name: monitor_name,
+            width,
+            height,
+        });
         Ok(())
     }
 
     fn get_monitor(&mut self, surface: &WlSurface, configure: bool) -> Option<Monitor> {
         if configure {
-            let monitor = self.monitors.iter_mut()
+            let monitor = self
+                .monitors
+                .iter_mut()
                 .find(|m| m.layer.wl_surface() == surface)?;
             monitor.configured = configure;
             return Some(monitor.clone());
         }
-        let monitor = self.monitors.iter()
+        let monitor = self
+            .monitors
+            .iter()
             .find(|m| m.layer.wl_surface() == surface)?;
         Some(monitor.clone())
     }
 
-    fn render(&mut self, qh: &QueueHandle<Self>, surface: &WlSurface, configure: bool) -> anyhow::Result<()> {
+    fn remove_frame(&mut self, surface: &WlSurface) -> Option<()> {
+        let monitor = self
+            .monitors
+            .iter_mut()
+            .find(|m| m.layer.wl_surface() == surface)?;
+        monitor.frame = Arc::new(vec![]);
+        Some(())
+    }
+
+    fn poll_frame(&mut self) {
+        // Current frames on all monitor's must be rendered first
+
+        let should_render = self.monitors.iter().all(|mon| mon.frame.is_empty());
+        if !should_render {
+            return;
+        }
+
+        let Ok(mut wp_buffer) = self.cons.pop() else {
+            return;
+        };
+
+        let buffer = Arc::new(wp_buffer.buffer.split_off(0));
+
+        for mon in self.monitors.iter_mut() {
+            if !wp_buffer.monitors.contains(&mon.name) {
+                continue;
+            }
+
+            mon.frame = buffer.clone();
+        }
+    }
+
+    fn render(
+        &mut self,
+        qh: &QueueHandle<Self>,
+        surface: &WlSurface,
+        configure: bool,
+    ) -> anyhow::Result<()> {
+        // 1. Poll for any new frames
+        // 2. Render new frame
         // tracing::info!("RENDERING FRAME");
-        let monitor = self.get_monitor(surface, configure).context("Monitor not found")?;
+        self.poll_frame();
+        let monitor = self
+            .get_monitor(surface, configure)
+            .context("Monitor not found")?;
         if !monitor.configured {
-            return Ok(())
+            return Ok(());
         }
 
-        if self.transition.is_finished() {
-            monitor.layer.wl_surface().frame(qh, monitor.layer.wl_surface().clone());
+        if monitor.frame.is_empty() {
+            // std::thread::sleep(std::time::Duration::from_millis(17));
+            monitor
+                .layer
+                .wl_surface()
+                .frame(qh, monitor.layer.wl_surface().clone());
             monitor.layer.commit();
-            return Ok(())
+            return Ok(());
         }
-
-        let frame = self.transition.get_frame();
 
         let width = monitor.width;
         let height = monitor.height;
@@ -125,15 +247,32 @@ impl WallpaperLayer {
             monitor.width,
             monitor.height,
             stride,
-            wl_shm::Format::Argb8888
+            wl_shm::Format::Argb8888,
         )?;
 
-        canvas.copy_from_slice(&frame);
-        monitor.layer.wl_surface().damage_buffer(0, 0, width, height);
-        monitor.layer.wl_surface().frame(qh, monitor.layer.wl_surface().clone());
+        let chunk_size = canvas.len() / 16;
+        canvas.par_chunks_mut(chunk_size)
+            .zip(monitor.frame.par_chunks(chunk_size))
+            .for_each(|(dest, src)| {
+                dest.copy_from_slice(src);
+            });
 
         buffer.attach_to(monitor.layer.wl_surface())?;
+        monitor
+            .layer
+            .wl_surface()
+            .damage_buffer(0, 0, width, height);
+
+        // Trigger render
+        monitor
+            .layer
+            .wl_surface()
+            .frame(qh, monitor.layer.wl_surface().clone());
         monitor.layer.commit();
+
+        tracing::info!("Finished rendering");
+
+        self.remove_frame(surface);
 
         Ok(())
     }
@@ -223,7 +362,7 @@ impl OutputHandler for WallpaperLayer {
 }
 
 impl LayerShellHandler for WallpaperLayer {
-    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _layer: &LayerSurface) { }
+    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _layer: &LayerSurface) {}
 
     fn configure(
         &mut self,
@@ -358,7 +497,6 @@ impl ProvidesRegistryState for WallpaperLayer {
     registry_handlers![OutputState, SeatState];
 }
 
-
 delegate_compositor!(WallpaperLayer);
 delegate_output!(WallpaperLayer);
 delegate_seat!(WallpaperLayer);
@@ -369,5 +507,3 @@ delegate_shm!(WallpaperLayer);
 delegate_layer!(WallpaperLayer);
 
 delegate_registry!(WallpaperLayer);
-
-
