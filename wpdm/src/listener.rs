@@ -1,16 +1,11 @@
-use std::{
-    collections::{BTreeMap},
-    thread::JoinHandle,
-};
+use std::{collections::BTreeMap, fs::OpenOptions, io::Read, path::PathBuf, thread::JoinHandle};
+use std::io::Write;
 
 use anyhow::Context;
 use rtrb::PushError;
 use wpdm_common::{WpdmListener, WpdmSetWallpaper};
 
-use crate::{
-    layer::{SharedMonitorMeta},
-    wp_loader::WpLoader,
-};
+use crate::{layer::SharedMonitorMeta, wp_loader::WpLoader};
 
 pub struct WpBuffer {
     // Buffer will be in argb form
@@ -45,6 +40,24 @@ impl WpdmServer {
         })
     }
 
+    pub fn config_path() -> Option<PathBuf> {
+        Some(std::env::home_dir()?
+            .join(".local")
+            .join("state")
+            .join("wpdm")
+            .join("config.conf"))
+    }
+
+    pub fn config_dir() -> Option<PathBuf> {
+        Self::config_path()?.parent().map(|p| p.to_path_buf())
+    }
+
+    pub fn wait_for_monitors(&self) {
+        while self.monitor_meta.read().unwrap().is_empty() { 
+            std::thread::sleep(std::time::Duration::from_millis(20))
+        }
+    }
+
     pub fn handle_change_wallpaper(&mut self, sw: WpdmSetWallpaper) -> anyhow::Result<()> {
         // 1. Generate all frames for wallpaper change
         // 2. Fetch current wallpaper (need wallpaper image loader, since we don't store current
@@ -66,7 +79,6 @@ impl WpdmServer {
             let buffer = image.buffer;
             let width = image.width;
             let height = image.height;
-            tracing::info!("Buffer size: {}", buffer.len());
             let mut wp_buffer = WpBuffer {
                 monitors: mons.into_iter().map(|v| v.to_string()).collect(),
                 buffer,
@@ -76,25 +88,43 @@ impl WpdmServer {
 
             while let Err(PushError::Full(wp_buff)) = self.producer.push(wp_buffer) {
                 wp_buffer = wp_buff;
-                tracing::error!("Frame buffer is full")
             }
         }
+
+        std::fs::create_dir_all(Self::config_dir().context("Failed to get config dir")?)?;
+        let mut save = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(Self::config_path().context("Failed to open config file")?)?;
+
+        writeln!(save, "{}", &sw.path)?;
 
         Ok(())
     }
 
-    pub fn on_start(&self) {
-        // Need to set default wallpaper
+    pub fn on_start(&mut self) -> anyhow::Result<()> {
+        let path = Self::config_path().context("Failed to get config path")?;
+        // std::fs::create_dir_all(&path).ok()?;
+        let mut data_file = OpenOptions::new().read(true).open(path)?;
+        let mut path = String::new();
+        let _ = data_file.read_to_string(&mut path)?;
+        let path = path.trim().to_string();
+        self.wait_for_monitors();
+        tracing::info!("Finished waiting for monitors, {:?}", &path);
+        self.handle_change_wallpaper(WpdmSetWallpaper { path })?;
+        Ok(())
     }
 
     pub fn run(mut self) -> anyhow::Result<WpdmServerHandle> {
-        self.on_start();
         let handle = std::thread::spawn(move || {
+            let _ = self.on_start()
+                .inspect_err(|e| tracing::error!("{}", e));
+
             loop {
                 let Some(message) = self.listener.poll() else {
                     continue;
                 };
-
 
                 match message {
                     wpdm_common::WpdmMessage::SetWallpaper(set_wallpaper) => {

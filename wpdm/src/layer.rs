@@ -1,9 +1,10 @@
-use std::{
-    sync::{Arc, RwLock},
-};
+use std::sync::{Arc, RwLock};
 
 use anyhow::Context;
-use rayon::{iter::{IndexedParallelIterator, ParallelIterator}, slice::{ParallelSlice, ParallelSliceMut}};
+use rayon::{
+    iter::{IndexedParallelIterator, ParallelIterator},
+    slice::{ParallelSlice, ParallelSliceMut},
+};
 use rtrb::Consumer;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
@@ -130,7 +131,6 @@ impl WallpaperLayer {
             .name
             .context("Failed to get monitor_name")?
             .clone();
-        tracing::info!("Monitor Detected: {}", monitor_name);
         let (width, height) = output_info
             .logical_size
             .context("Failed to get monitor width and height")?;
@@ -251,7 +251,8 @@ impl WallpaperLayer {
         )?;
 
         let chunk_size = canvas.len() / 16;
-        canvas.par_chunks_mut(chunk_size)
+        canvas
+            .par_chunks_mut(chunk_size)
             .zip(monitor.frame.par_chunks(chunk_size))
             .for_each(|(dest, src)| {
                 dest.copy_from_slice(src);
@@ -269,8 +270,6 @@ impl WallpaperLayer {
             .wl_surface()
             .frame(qh, monitor.layer.wl_surface().clone());
         monitor.layer.commit();
-
-        tracing::info!("Finished rendering");
 
         self.remove_frame(surface);
 

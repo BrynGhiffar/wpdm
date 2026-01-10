@@ -1,7 +1,9 @@
 use std::{
     io::{Read, Write},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream}, path::Path,
 };
+
+use anyhow::Context;
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct WpdmSetWallpaper {
@@ -38,6 +40,8 @@ impl WpdmClient {
     }
 
     pub fn set_wallpaper(&mut self, path: String) -> anyhow::Result<bool> {
+        let path = Path::new(&path).to_path_buf().canonicalize()?;
+        let path = path.to_str().context("Failed to convert canonicalized path to string")?.to_string();
         let message = WpdmMessage::set_wallpaper(path);
         postcard::to_io(&message, &mut self.stream)
             .inspect_err(|err| tracing::error!("Failed to send set wallpaper: {}", err))?;
@@ -72,13 +76,11 @@ impl WpdmListener {
 
         let amt = stream.read_to_end(&mut bytes).ok()?;
 
-        tracing::info!("amount: {:?}", amt);
 
         let result = postcard::from_bytes(&bytes[..amt])
             .inspect_err(|err| tracing::error!("Error when deserializing: {}", err))
             .ok();
 
-        tracing::info!("Result is: {:?}", result);
         let _ = stream.write(&[1; 4]).ok()?;
         result
     }

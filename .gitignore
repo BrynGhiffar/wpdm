@@ -1,2 +1,4 @@
 /target
 .env
+pkg/
+*.pkg.tar.zst
