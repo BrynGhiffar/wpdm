@@ -61,7 +61,7 @@ impl WallpaperLayer {
         };
 
         loop {
-            evt_queue.blocking_dispatch(self)?;
+            evt_queue.dispatch_pending(self)?;
         }
     }
 

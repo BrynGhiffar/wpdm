@@ -13,3 +13,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 wpdm-common = { workspace = true }
 rtrb = { workspace = true }
+gcd = { workspace = true }
+sha2 = { workspace = true }
+lz4 = { workspace = true }
