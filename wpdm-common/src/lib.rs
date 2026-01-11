@@ -1,6 +1,6 @@
 use std::{
-    io::{Read, Write},
-    net::{TcpListener, TcpStream}, path::Path,
+    net::{TcpListener, TcpStream},
+    path::Path,
 };
 
 use anyhow::Context;
@@ -15,7 +15,6 @@ pub enum WpdmMessage {
     SetWallpaper(WpdmSetWallpaper),
 }
 
-const SUCCESS: [u8; 4] = [1; 4];
 const DEFAULT_PORT: u16 = 64647;
 
 impl WpdmMessage {
@@ -41,14 +40,15 @@ impl WpdmClient {
 
     pub fn set_wallpaper(&mut self, path: String) -> anyhow::Result<bool> {
         let path = Path::new(&path).to_path_buf().canonicalize()?;
-        let path = path.to_str().context("Failed to convert canonicalized path to string")?.to_string();
+        let path = path
+            .to_str()
+            .context("Failed to convert canonicalized path to string")?
+            .to_string();
         let message = WpdmMessage::set_wallpaper(path);
         postcard::to_io(&message, &mut self.stream)
             .inspect_err(|err| tracing::error!("Failed to send set wallpaper: {}", err))?;
-        self.stream.shutdown(std::net::Shutdown::Write)?;
-        let mut buffer = [0; 4];
-        let amount = self.stream.read(&mut buffer)?;
-        Ok((buffer == SUCCESS) && (amount == buffer.len()))
+        self.stream.shutdown(std::net::Shutdown::Both)?;
+        Ok(true)
     }
 }
 
@@ -68,20 +68,14 @@ impl WpdmListener {
     }
 
     pub fn poll(&self) -> Option<WpdmMessage> {
-        tracing::info!("Polling for connections");
+        tracing::info!("Waiting for connection...");
         let (mut stream, incoming_addr) = self.listener.accept().ok()?;
 
-        tracing::info!("Connection created from: {}", incoming_addr);
-        let mut bytes = Vec::new();
+        tracing::info!("Received connection from from: {}", incoming_addr);
+        let mut bytes = [0;1024];
 
-        let amt = stream.read_to_end(&mut bytes).ok()?;
+        let (res, _) = postcard::from_io::<WpdmMessage, _>((&mut stream, &mut bytes)).ok()?;
 
-
-        let result = postcard::from_bytes(&bytes[..amt])
-            .inspect_err(|err| tracing::error!("Error when deserializing: {}", err))
-            .ok();
-
-        let _ = stream.write(&[1; 4]).ok()?;
-        result
+        Some(res)
     }
 }

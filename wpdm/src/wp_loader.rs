@@ -1,4 +1,5 @@
 use gcd::Gcd;
+use image::ImageReader;
 use rayon::{iter::ParallelIterator, slice::ParallelSliceMut};
 use std::path::Path;
 
@@ -62,7 +63,11 @@ impl<P: AsRef<Path>> WpLoader<P> {
     }
 
     pub fn load(self) -> anyhow::Result<WpBuffer> {
-        let img = image::open(self.path.as_ref()).inspect_err(|err| tracing::error!("Error when loading image: {}", err))?;
+        let img = ImageReader::open(self.path.as_ref())?
+            .with_guessed_format()?
+            .decode()
+            .inspect_err(|err| tracing::error!("Error when loading image: {}", err))?;
+        // let img = image::open(self.path.as_ref()).inspect_err(|err| tracing::error!("Error when loading image: {}", err))?;
         let img = self.center(img);
         let mut buffer = img.to_rgba8().to_vec();
 

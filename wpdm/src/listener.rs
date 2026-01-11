@@ -1,5 +1,5 @@
-use std::{collections::BTreeMap, fs::OpenOptions, io::Read, path::PathBuf, thread::JoinHandle};
 use std::io::Write;
+use std::{collections::BTreeMap, fs::OpenOptions, io::Read, path::PathBuf, thread::JoinHandle};
 
 use anyhow::Context;
 use rtrb::PushError;
@@ -41,11 +41,13 @@ impl WpdmServer {
     }
 
     pub fn config_path() -> Option<PathBuf> {
-        Some(std::env::home_dir()?
-            .join(".local")
-            .join("state")
-            .join("wpdm")
-            .join("config.conf"))
+        Some(
+            std::env::home_dir()?
+                .join(".local")
+                .join("state")
+                .join("wpdm")
+                .join("config.conf"),
+        )
     }
 
     pub fn config_dir() -> Option<PathBuf> {
@@ -53,7 +55,7 @@ impl WpdmServer {
     }
 
     pub fn wait_for_monitors(&self) {
-        while self.monitor_meta.read().unwrap().is_empty() { 
+        while self.monitor_meta.read().unwrap().is_empty() {
             std::thread::sleep(std::time::Duration::from_millis(20))
         }
     }
@@ -65,7 +67,6 @@ impl WpdmServer {
         // 3. Generate frame transitions between set_wallpaper
         let mut hm = BTreeMap::<(i32, i32), Vec<&str>>::new();
         let monitors = self.monitor_meta.read().unwrap();
-        tracing::info!("monitors: {}", monitors.len());
         for mon in monitors.iter() {
             if let Some(ent) = hm.get_mut(&(mon.width, mon.height)) {
                 ent.push(&mon.name);
@@ -118,8 +119,7 @@ impl WpdmServer {
 
     pub fn run(mut self) -> anyhow::Result<WpdmServerHandle> {
         let handle = std::thread::spawn(move || {
-            let _ = self.on_start()
-                .inspect_err(|e| tracing::error!("{}", e));
+            let _ = self.on_start().inspect_err(|e| tracing::error!("{}", e));
 
             loop {
                 let Some(message) = self.listener.poll() else {
