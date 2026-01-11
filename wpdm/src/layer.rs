@@ -5,7 +5,6 @@ use rayon::{
     iter::{IndexedParallelIterator, ParallelIterator},
     slice::{ParallelSlice, ParallelSliceMut},
 };
-use rtrb::Consumer;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
@@ -36,6 +35,8 @@ use wayland_client::{
     },
 };
 
+use std::sync::mpsc::Receiver;
+
 use crate::listener::WpBuffer;
 
 #[derive(Clone)]
@@ -58,7 +59,7 @@ pub struct Monitor {
 }
 
 pub struct WallpaperLayer {
-    cons: Consumer<WpBuffer>,
+    cons: Receiver<WpBuffer>,
     registry_state: RegistryState,
     seat_state: SeatState,
     output_state: OutputState,
@@ -72,7 +73,7 @@ pub struct WallpaperLayer {
 }
 
 impl WallpaperLayer {
-    pub fn new(cons: Consumer<WpBuffer>) -> anyhow::Result<Self> {
+    pub fn new(cons: Receiver<WpBuffer>) -> anyhow::Result<Self> {
         let conn = Connection::connect_to_env()?;
         let (globals, event_queue) = registry_queue_init::<WallpaperLayer>(&conn)?;
         let qh = event_queue.handle();
@@ -110,10 +111,10 @@ impl WallpaperLayer {
         };
         tracing::info!("Running Layer");
 
+        evt_queue.roundtrip(self)?;
+
         loop {
             evt_queue.blocking_dispatch(self)?;
-            // NOTE: for some reason if I don't put this it crashes?
-            std::thread::sleep(std::time::Duration::from_millis(17));
         }
     }
 
@@ -198,7 +199,7 @@ impl WallpaperLayer {
             return;
         }
 
-        let Ok(mut wp_buffer) = self.cons.pop() else {
+        let Ok(mut wp_buffer) = self.cons.recv() else {
             return;
         };
 
