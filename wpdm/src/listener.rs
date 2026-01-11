@@ -32,12 +32,13 @@ struct GrowCircleTransition {
 impl Iterator for GrowCircleTransition {
     type Item = WpBuffer;
     fn next(&mut self) -> Option<Self::Item> {
+        let n_frames= 40;
         let curr = self.curr.as_ref()?;
         let next = self.next.as_ref()?;
         // assume 60 fps
         // 4 second animation
         // need to complete animation in 240 frames
-        if self.f == 240 {
+        if self.f == n_frames {
             return self.next.take()
         }
         let f = self.f as i32;
@@ -54,7 +55,7 @@ impl Iterator for GrowCircleTransition {
         };
 
         let max_diam = [(0, 0), (0, height), (width, 0), (width, height)].into_iter().map(|(x, y)| dist((center_x, center_y), (x, y))).max().unwrap();
-        let diam = (f * max_diam) / 240;
+        let diam = (f * max_diam) / (n_frames as i32);
 
         let mut output_buffer = vec![0; (width * height * 4) as usize];
         output_buffer.par_chunks_mut(4)
