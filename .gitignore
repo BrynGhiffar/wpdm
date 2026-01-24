@@ -2,3 +2,4 @@
 .env
 pkg/
 *.pkg.tar.zst
+massif.out.*
