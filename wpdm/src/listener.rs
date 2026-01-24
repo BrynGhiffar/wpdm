@@ -1,11 +1,11 @@
-use std::io::Write;
 use std::sync::mpsc;
-use std::{collections::BTreeMap, fs::OpenOptions, io::Read, path::PathBuf, thread::JoinHandle};
+use std::{collections::BTreeMap, fs::OpenOptions, io::Read, thread::JoinHandle};
 
 use anyhow::Context;
 use rayon::iter::{IndexedParallelIterator, ParallelIterator};
 use rayon::slice::{ParallelSlice, ParallelSliceMut};
-use wpdm_common::{WpdmListener, WpdmSetWallpaper};
+use wpdm_common::config::save_wp_path;
+use wpdm_common::{config, WpdmListener, WpdmMonitor, WpdmSetWallpaper};
 
 use crate::{layer::SharedMonitorMeta, loader::WpLoader};
 
@@ -90,29 +90,14 @@ pub struct WpdmServer {
 
 impl WpdmServer {
     pub fn new(
-        port: Option<u16>,
         producer: mpsc::SyncSender<WpBuffer>,
         monitor_meta: SharedMonitorMeta,
     ) -> anyhow::Result<Self> {
         Ok(Self {
-            listener: WpdmListener::new(port)?,
+            listener: WpdmListener::new()?,
             producer,
             monitor_meta,
         })
-    }
-
-    pub fn config_path() -> Option<PathBuf> {
-        Some(
-            std::env::home_dir()?
-                .join(".local")
-                .join("state")
-                .join("wpdm")
-                .join("config.conf"),
-        )
-    }
-
-    pub fn config_dir() -> Option<PathBuf> {
-        Self::config_path()?.parent().map(|p| p.to_path_buf())
     }
 
     pub fn wait_for_monitors(&self) {
@@ -136,6 +121,8 @@ impl WpdmServer {
             }
         }
 
+        tracing::info!("change path: {}", &sw.path);
+
         for ((width, height), mons) in hm.into_iter() {
             let mut image = WpLoader::config(&sw.path, width as u32, height as u32).load()?;
             // Need to generate transition frames here, an animation/transition is just an iterator
@@ -157,20 +144,13 @@ impl WpdmServer {
                 .inspect_err(|e| tracing::error!("Failed sending buffer: {}", e));
         }
 
-        std::fs::create_dir_all(Self::config_dir().context("Failed to get config dir")?)?;
-        let mut save = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(Self::config_path().context("Failed to open config file")?)?;
-
-        writeln!(save, "{}", &sw.path)?;
+        save_wp_path(&sw.path)?;
 
         Ok(())
     }
 
     pub fn get_curr_wp_path(&self) -> anyhow::Result<String> {
-        let path = Self::config_path().context("Failed to get config path")?;
+        let path = config::config_path().context("Failed to get config path")?;
         let mut data_file = OpenOptions::new().read(true).open(path)?;
         let mut path = String::new();
         let _ = data_file.read_to_string(&mut path)?;
@@ -191,7 +171,8 @@ impl WpdmServer {
             let _ = self.on_start().inspect_err(|e| tracing::error!("{}", e));
 
             loop {
-                let Some(message) = self.listener.poll() else {
+                let Ok(message) = self.listener.poll()
+                    .inspect_err(|err| tracing::error!("Error when polling: {}", err)) else {
                     continue;
                 };
 
@@ -200,7 +181,17 @@ impl WpdmServer {
                         if let Err(err) = self.handle_change_wallpaper(set_wallpaper) {
                             tracing::error!("Error during change wallpaper: {}", err);
                         }
-                    }
+                    },
+                    wpdm_common::WpdmMessage::QueryMonitor => {
+                        let monitor_metas = self.monitor_meta.read().unwrap();
+                        let monitors = monitor_metas.iter()
+                            .map(|mm| WpdmMonitor { name: mm.name.clone(), height: mm.height, width: mm.width })
+                            .collect::<Vec<_>>();
+                        let _ = self.listener.monitors(monitors)
+                            .inspect_err(|err| tracing::error!("Failed to send monitors: {}", err));
+                    },
+                    // Ignoring, this since client should never receive it
+                    wpdm_common::WpdmMessage::Monitors(_) => { }
                 };
             }
         });

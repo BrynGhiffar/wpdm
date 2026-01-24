@@ -16,3 +16,7 @@ serde = { version = "1.0", features = [ "derive" ]}
 rtrb = { version = "0.3.2" }
 wpdm-common = { path = "./wpdm-common"}
 gcd = "2.3.0"
+mio = { version = "1.1.1", features = [ "os-poll", "net" ]}
+fast_image_resize = { version = "6.0", features = ["image"] }
+sha2 = { version = "0.10.9" }
+thiserror = "2.0"
