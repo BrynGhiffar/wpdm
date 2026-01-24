@@ -1,6 +1,5 @@
 pub mod serde_udp;
 pub mod config;
-use std::net::TcpStream;
 
 use anyhow::anyhow;
 
@@ -28,39 +27,6 @@ pub enum WpdmMessage {
     SetWallpaper(WpdmSetWallpaper),
     QueryMonitor,
     Monitors(WpdmMonitors)
-}
-
-pub trait WpdmStream {
-    fn send_wpdm(&mut self, message: &WpdmMessage) -> anyhow::Result<()>;
-    fn recv_wpdm(&mut self) -> anyhow::Result<WpdmMessage>;
-}
-
-impl WpdmStream for mio::net::TcpStream {
-    fn send_wpdm(&mut self, message: &WpdmMessage) -> anyhow::Result<()> {
-        let _ = postcard::to_io(message, self)?;
-        Ok(())
-    }
-
-    fn recv_wpdm(&mut self) -> anyhow::Result<WpdmMessage> {
-        const MAX_SIZE: usize = 1000 * 1024;
-        let mut bytes = [0; MAX_SIZE];
-        let (res, _) = postcard::from_io::<WpdmMessage, _>((self, &mut bytes))?;
-        Ok(res)
-    }
-}
-
-impl WpdmStream for TcpStream {
-    fn send_wpdm(&mut self, message: &WpdmMessage) -> anyhow::Result<()> {
-        let _ = postcard::to_io(message, self)?;
-        Ok(())
-    }
-
-    fn recv_wpdm(&mut self) -> anyhow::Result<WpdmMessage> {
-        const MAX_SIZE: usize = 1000 * 1024;
-        let mut bytes = [0; MAX_SIZE];
-        let (res, _) = postcard::from_io::<WpdmMessage, _>((self, &mut bytes))?;
-        Ok(res)
-    }
 }
 
 impl WpdmMessage {

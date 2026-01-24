@@ -56,7 +56,7 @@ fn main() -> anyhow::Result<()> {
 
     let path = Path::new(&args.image_path).to_path_buf().canonicalize()?;
 
-    let img = ImageReader::open(path)?.decode()?;
+    let img = ImageReader::open(path)?.with_guessed_format()?.decode()?;
     let monitors = client.get_monitors()?;
     let sizes = monitors.into_iter()
         .fold(HashMap::<(i32, i32), Vec<String>>::new(), |mut init, nxt| {
