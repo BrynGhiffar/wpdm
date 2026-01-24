@@ -95,7 +95,6 @@ fn main() -> anyhow::Result<()> {
             .write_image(dst_image.buffer(), width as u32, height as u32, img.color().into())?;
 
         let str_path = path.to_str().context("Cannot convert path to string")?.to_string();
-        println!("Writing image to {}", &str_path);
         client.set_wallpaper(str_path)?;
     }
 
