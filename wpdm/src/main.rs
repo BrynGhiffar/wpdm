@@ -3,6 +3,10 @@
 mod layer;
 mod listener;
 mod loader;
+mod transitions;
+mod renderer;
+mod util;
+mod handler;
 
 use std::sync::mpsc;
 
@@ -16,7 +20,8 @@ fn main() -> anyhow::Result<()> {
     let mut layer = WallpaperLayer::new(cons)?;
     let server = WpdmServer::new(prod, layer.get_monitor_meta())?;
 
-    let handle = server.run()?;
+    let handle = server.run();
+
     layer.run()?;
     handle.wait()?;
     Ok(())

@@ -12,3 +12,4 @@ fast_image_resize = { workspace = true }
 image = { workspace = true }
 gcd = { workspace = true }
 sha2 = { workspace = true }
+rayon = { workspace = true }

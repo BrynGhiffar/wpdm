@@ -1331,6 +1331,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "simsimd"
+version = "6.5.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a0dcd49d13a0950ae06cd46597cfad99a9d23797e4e9f9e2b29decdc016b3f7"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "slab"
 version = "0.4.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1757,9 +1766,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "gcd",
- "image",
+ "libc",
+ "memmap2",
  "rayon",
  "rtrb",
+ "simsimd",
  "smithay-client-toolkit",
  "tracing",
  "tracing-subscriber",
@@ -1776,6 +1787,7 @@ dependencies = [
  "fast_image_resize",
  "gcd",
  "image",
+ "rayon",
  "sha2",
  "tracing-subscriber",
  "wpdm-common",

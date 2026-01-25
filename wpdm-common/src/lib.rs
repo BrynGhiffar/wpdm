@@ -8,6 +8,7 @@ use crate::serde_udp::SerdeUdp;
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct WpdmSetWallpaper {
     pub path: String,
+    pub monitors: Vec<String>
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
@@ -30,8 +31,8 @@ pub enum WpdmMessage {
 }
 
 impl WpdmMessage {
-    pub fn set_wallpaper(path: String) -> Self {
-        Self::SetWallpaper(WpdmSetWallpaper { path })
+    pub fn set_wallpaper(path: String, monitors: Vec<String>) -> Self {
+        Self::SetWallpaper(WpdmSetWallpaper { path, monitors })
     }
 }
 
@@ -52,8 +53,8 @@ impl WpdmClient {
         Ok(Self { stream })
     }
 
-    pub fn set_wallpaper(&mut self, path: String) -> anyhow::Result<()> {
-        let message = WpdmMessage::set_wallpaper(path);
+    pub fn set_wallpaper(&mut self, path: String, monitors: Vec<String>) -> anyhow::Result<()> {
+        let message = WpdmMessage::set_wallpaper(path, monitors);
 
         self.stream.send(message)
             .inspect_err(|err| tracing::error!("Failed to send set wallpaper: {}", err))?;

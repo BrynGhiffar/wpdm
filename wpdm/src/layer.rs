@@ -1,52 +1,41 @@
-use std::sync::{Arc, RwLock};
+extern crate libc;
+
+use std::{collections::BTreeMap, path::PathBuf, sync::{Arc, RwLock}};
 
 use anyhow::Context;
-use rayon::{
-    iter::{IndexedParallelIterator, ParallelIterator},
-    slice::{ParallelSlice, ParallelSliceMut},
-};
+use memmap2::Mmap;
 use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
-    delegate_registry, delegate_seat, delegate_shm,
-    output::{OutputHandler, OutputState},
-    registry::{ProvidesRegistryState, RegistryState},
-    registry_handlers,
-    seat::{
-        Capability, SeatHandler, SeatState,
-        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers},
-        pointer::{PointerEvent, PointerHandler},
-    },
+    compositor::CompositorState,
+    output::OutputState,
+    registry::RegistryState,
+    seat::SeatState,
     shell::{
-        WaylandSurface,
         wlr_layer::{
-            Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
-            LayerSurfaceConfigure,
-        },
+            Anchor, KeyboardInteractivity, Layer, LayerShell, LayerSurface,
+        }, WaylandSurface
     },
-    shm::{Shm, ShmHandler, slot::SlotPool},
+    shm::{slot::{Buffer, SlotPool}, Shm},
 };
 use wayland_client::{
     Connection, EventQueue, QueueHandle,
     globals::registry_queue_init,
     protocol::{
-        wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm,
-        wl_surface::{self, WlSurface},
+        wl_output, wl_shm,
+        wl_surface::WlSurface,
     },
 };
 
 use std::sync::mpsc::Receiver;
 
-use crate::listener::WpBuffer;
+use crate::{loader::{load_argb_buffer, mmap_buffer}, transitions::grow_circ::GrowCircleTransition};
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct MonitorMeta {
     pub name: String,
     pub width: i32,
     pub height: i32,
 }
 
-pub type SharedMonitorMeta = Arc<RwLock<Vec<MonitorMeta>>>;
 
 #[derive(Clone)]
 pub struct Monitor {
@@ -54,28 +43,91 @@ pub struct Monitor {
     pub layer: LayerSurface,
     pub width: i32,
     pub height: i32,
-    pub frame: Arc<Vec<u8>>,
     pub configured: bool,
 }
 
+pub struct Transition {
+    monitors: Vec<String>,
+    frames: Vec<u32>,
+    from_buffer: Mmap,
+    to_buffer: Mmap,
+    transition: GrowCircleTransition
+}
+
+pub enum RenderCommand {
+    Transition {
+        monitors: Vec<String>,
+        src_argb_buff_path: PathBuf,
+        dest_argb_buff_path: PathBuf
+    }
+}
+
+pub struct TransitionManager {
+    pub transitions: Vec<Transition>
+}
+
+impl TransitionManager {
+    fn new() -> Self {
+        Self { transitions: vec![] }
+    }
+
+    fn render_transition(&mut self, monitor: &str, buffer: &mut [u8]) -> Option<()> {
+        let tr_idx = self.transitions.iter()
+            .position(|tr| tr.monitors.iter()
+                .any(|ss| ss.as_str().eq(monitor)))?;
+        let tr = self.transitions.get_mut(tr_idx)?;
+        let idx = tr.monitors.iter().position(|tr| tr.as_str().eq(monitor))?;
+        let curr_frame = tr.frames.get_mut(idx)?;
+
+        let ret = tr.transition.render(
+            *curr_frame, 
+            &tr.from_buffer, 
+            &tr.to_buffer, 
+            buffer
+        );
+        if !ret {
+            *curr_frame += 1;
+        } else {
+            // If monitor has finished transition, remove monitor from monitors
+            tr.monitors.remove(idx);
+            tr.frames.remove(idx);
+        }
+
+        if tr.monitors.is_empty() {
+            tracing::info!("Removing transition!");
+            self.transitions.remove(tr_idx);
+        }
+        Some(())
+    }
+
+    fn has_transitions(&self) -> bool {
+        !self.transitions.is_empty()
+    }
+
+}
+
+
+pub type SharedMonitorMeta = Arc<RwLock<Vec<MonitorMeta>>>;
 pub struct WallpaperLayer {
-    cons: Receiver<WpBuffer>,
-    registry_state: RegistryState,
-    seat_state: SeatState,
-    output_state: OutputState,
-    event_queue: Option<EventQueue<Self>>,
-    layer_shell: LayerShell,
-    compositor_state: CompositorState,
-    pool: SlotPool,
-    shm: Shm,
-    monitor_meta: Arc<RwLock<Vec<MonitorMeta>>>,
+    pub registry_state: RegistryState,
+    pub seat_state: SeatState,
+    pub output_state: OutputState,
+    pub event_queue: Option<EventQueue<Self>>,
+    pub layer_shell: LayerShell,
+    pub compositor_state: CompositorState,
+    pub pool: SlotPool,
+    pub shm: Shm,
+
+    cons: Receiver<RenderCommand>,
+    monitor_meta: SharedMonitorMeta,
     monitors: Vec<Monitor>,
+    transition_manager: Option<TransitionManager>
 }
 
 impl WallpaperLayer {
-    pub fn new(cons: Receiver<WpBuffer>) -> anyhow::Result<Self> {
+    pub fn new(cons: Receiver<RenderCommand>) -> anyhow::Result<Self> {
         let conn = Connection::connect_to_env()?;
-        let (globals, event_queue) = registry_queue_init::<WallpaperLayer>(&conn)?;
+        let (globals, event_queue) = registry_queue_init::<Self>(&conn)?;
         let qh = event_queue.handle();
 
         let compositor_state = CompositorState::bind(&globals, &qh)?;
@@ -87,84 +139,158 @@ impl WallpaperLayer {
         let monitors = vec![];
 
         Ok(Self {
-            cons,
-            compositor_state,
             registry_state: RegistryState::new(&globals),
             seat_state: SeatState::new(&globals, &qh),
             output_state: OutputState::new(&globals, &qh),
             event_queue: Some(event_queue),
             layer_shell,
+            compositor_state,
             pool,
             shm,
+
+            cons,
             monitor_meta: Arc::new(RwLock::new(vec![])),
             monitors,
+            transition_manager: Some(TransitionManager::new()),
         })
     }
 
-    pub fn get_monitor_meta(&self) -> SharedMonitorMeta {
-        self.monitor_meta.clone()
-    }
-
-    pub fn run(&mut self) -> anyhow::Result<()> {
-        let Some(mut evt_queue) = self.event_queue.take() else {
-            return Ok(());
-        };
-        tracing::info!("Running Layer");
-
-        evt_queue.roundtrip(self)?;
-
-        loop {
-            evt_queue.blocking_dispatch(self)?;
-        }
-    }
-
-    pub fn handle_new_output(
+    pub fn setup_monitor(
         &mut self,
         qh: &QueueHandle<Self>,
         output: wl_output::WlOutput,
     ) -> anyhow::Result<()> {
         tracing::info!("New Monitor!");
-        let output_info = self
-            .output_state
-            .info(&output)
-            .context("Failed to get output info")?;
-        let monitor_name = output_info
-            .name
-            .context("Failed to get monitor_name")?
-            .clone();
-        let (width, height) = output_info
-            .logical_size
-            .context("Failed to get monitor width and height")?;
-        let surface = self.compositor_state.create_surface(qh);
-        let layer = self.layer_shell.create_layer_surface(
-            qh,
-            surface,
-            Layer::Background,
-            Some("background_layer"),
-            Some(&output),
-        );
-        tracing::info!("Handle new monitor: {}", monitor_name);
-        layer.set_anchor(Anchor::BOTTOM);
-        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-        layer.set_size(width as u32, height as u32);
-        layer.commit();
+
+        // This should be in a method.
+        let monitor_meta = self.create_monitor_meta(&output)?;
+        tracing::info!("Monitor Info: {:?}", monitor_meta);
+
+        let layer = self.create_layer_shell(qh, &output, &monitor_meta);
+
         let monitor = Monitor {
-            name: monitor_name.clone(),
-            width,
-            height,
+            name: monitor_meta.name.clone(),
+            width: monitor_meta.width,
+            height: monitor_meta.height,
             layer,
             configured: false,
-            frame: Arc::new(Vec::new()),
         };
         self.monitors.push(monitor);
         let mut mons = self.monitor_meta.write().unwrap();
-        mons.push(MonitorMeta {
-            name: monitor_name,
-            width,
-            height,
-        });
+        mons.push(monitor_meta);
         Ok(())
     }
+
+    pub fn render(
+        &mut self,
+        qh: &QueueHandle<Self>,
+        surface: &WlSurface,
+        configure: bool,
+    ) -> anyhow::Result<()> {
+        // 1. Poll for any new frames
+        // 2. Render new frame
+        // tracing::info!("RENDERING FRAME");
+        let monitor = self
+            .get_monitor(surface, configure)
+            .context("Monitor not found")?;
+        if !monitor.configured {
+            return Ok(());
+        }
+
+        let mut transition_manager = self.transition_manager.take()
+            .context("Missing transition manager")?;
+
+        let (buffer, canvas) = self.create_buffer(&monitor)?;
+        transition_manager.render_transition(&monitor.name, canvas);
+
+        let has_transitions = transition_manager.has_transitions();
+        self.transition_manager.replace(transition_manager);
+        self.flush_buffer(&buffer, &monitor)?;
+        self.request_render(qh, &monitor);
+
+        if !has_transitions {
+            let result = unsafe { libc::malloc_trim(0) };
+            if result == 1 {
+                tracing::info!("Memory was released back to the system.");
+            } else {
+                tracing::info!("No memory could be released, or the function is not available on this platform.");
+            }
+
+            self.wait_for_commands();
+        }
+
+
+        Ok(())
+    }
+
+    fn wait_for_commands(&mut self) {
+        let Ok(command) = self.cons.recv() else {
+            return;
+        };
+
+        // Possible to cater for more complicated transition types
+        match command {
+            RenderCommand::Transition {
+                monitors,
+                src_argb_buff_path,
+                dest_argb_buff_path
+            } => {
+                let mut map = BTreeMap::<(u32, u32), Vec<String>>::new();
+                for mon in monitors {
+                    let Some((width, height)) = self.get_monitor_size(&mon) else {
+                        continue;
+                    };
+                    if let Some(mons) = map.get_mut(&(width, height)) {
+                        mons.push(mon);
+                    } else {
+                        map.insert((width, height), vec![mon]);
+                    }
+                }
+
+                // Only expected to loop once, since message from upstream, must be one message,
+                // per monitor size
+                for ((width, height), monitors) in map {
+                    let Ok(from_buffer) = mmap_buffer(src_argb_buff_path.clone()) else {
+                        return;
+                    };
+                    let Ok(to_buffer) = mmap_buffer(dest_argb_buff_path.clone()) else {
+                        return;
+                    };
+                    let expected_buffer_len = (width * height * 4) as usize;
+                    if from_buffer.len() != expected_buffer_len {
+                        tracing::error!("Failed to create transition, since from buffer len is unexpected size: {}", from_buffer.len());
+                        continue;
+                    }
+
+                    if to_buffer.len() != expected_buffer_len {
+                        tracing::error!("Failed to create transition, since to buffer len is unexpected size: {}", to_buffer.len());
+                        continue;
+                    }
+
+                    let tr = Transition {
+                        frames: vec![0; monitors.len()],
+                        monitors,
+                        transition: GrowCircleTransition::new(width, height),
+                        from_buffer,
+                        to_buffer
+                    };
+
+                    if let Some(trm) = self.transition_manager.as_mut() {
+                        trm.transitions.push(tr);
+                    }
+                }
+            }
+        };
+
+    }
+
+    fn get_monitor_size(&self, monitor: &str) -> Option<(u32, u32)> {
+        let read_shared = self.monitor_meta.read().unwrap();
+        let meta = read_shared.iter()
+            .find(|meta| meta.name == monitor)?;
+        Some((meta.width as u32, meta.height as u32))
+    }
+
 
     fn get_monitor(&mut self, surface: &WlSurface, configure: bool) -> Option<Monitor> {
         if configure {
@@ -182,328 +308,87 @@ impl WallpaperLayer {
         Some(monitor.clone())
     }
 
-    fn remove_frame(&mut self, surface: &WlSurface) -> Option<()> {
-        let monitor = self
-            .monitors
-            .iter_mut()
-            .find(|m| m.layer.wl_surface() == surface)?;
-        monitor.frame = Arc::new(vec![]);
-        Some(())
-    }
-
-    fn poll_frame(&mut self) {
-        // Current frames on all monitor's must be rendered first
-
-        let should_render = self.monitors.iter().all(|mon| mon.frame.is_empty());
-        if !should_render {
-            return;
-        }
-
-        let Ok(mut wp_buffer) = self.cons.recv() else {
-            return;
-        };
-
-        let buffer = Arc::new(wp_buffer.buffer.split_off(0));
-
-        for mon in self.monitors.iter_mut() {
-            if !wp_buffer.monitors.contains(&mon.name) {
-                continue;
-            }
-
-            mon.frame = buffer.clone();
-        }
-    }
-
-    fn render(
-        &mut self,
-        qh: &QueueHandle<Self>,
-        surface: &WlSurface,
-        configure: bool,
-    ) -> anyhow::Result<()> {
-        // 1. Poll for any new frames
-        // 2. Render new frame
-        // tracing::info!("RENDERING FRAME");
-        self.poll_frame();
-        let monitor = self
-            .get_monitor(surface, configure)
-            .context("Monitor not found")?;
-        if !monitor.configured {
-            return Ok(());
-        }
-
-        if monitor.frame.is_empty() {
-            // std::thread::sleep(std::time::Duration::from_millis(17));
-            monitor
-                .layer
-                .wl_surface()
-                .frame(qh, monitor.layer.wl_surface().clone());
-            monitor.layer.commit();
-            return Ok(());
-        }
-
-        let width = monitor.width;
-        let height = monitor.height;
-        let stride = width * 4;
-        let (buffer, canvas) = self.pool.create_buffer(
-            monitor.width,
-            monitor.height,
-            stride,
-            wl_shm::Format::Argb8888,
-        )?;
-
-        let chunk_size = canvas.len() / 16;
-        canvas
-            .par_chunks_mut(chunk_size)
-            .zip(monitor.frame.par_chunks(chunk_size))
-            .for_each(|(dest, src)| {
-                dest.copy_from_slice(src);
-            });
-
-        buffer.attach_to(monitor.layer.wl_surface())?;
-        monitor
-            .layer
-            .wl_surface()
-            .damage_buffer(0, 0, width, height);
-
-        // Trigger render
+    fn request_render(&self, qh: &QueueHandle<Self>, monitor: &Monitor) {
         monitor
             .layer
             .wl_surface()
             .frame(qh, monitor.layer.wl_surface().clone());
         monitor.layer.commit();
+    }
 
-        self.remove_frame(surface);
-
+    fn flush_buffer(&self, buffer: &Buffer, monitor: &Monitor) -> anyhow::Result<()> {
+        buffer.attach_to(monitor.layer.wl_surface())?;
+        monitor
+            .layer
+            .wl_surface()
+            .damage_buffer(0, 0, monitor.width, monitor.height);
         Ok(())
     }
-}
 
-impl CompositorHandler for WallpaperLayer {
-    fn scale_factor_changed(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
-        _new_factor: i32,
-    ) {
-        // Not needed for this example.
+    fn create_buffer(&mut self, monitor: &Monitor) -> anyhow::Result<(Buffer, &mut [u8])> {
+        let (buffer, canvas) = self.pool.create_buffer(
+            monitor.width,
+            monitor.height,
+            monitor.width * 4,
+            wl_shm::Format::Argb8888,
+        )?;
+
+        Ok((buffer, canvas))
     }
 
-    fn transform_changed(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
-        _new_transform: wl_output::Transform,
-    ) {
-        // Not needed for this example.
+    pub fn get_monitor_meta(&self) -> SharedMonitorMeta {
+        self.monitor_meta.clone()
     }
 
-    fn frame(
-        &mut self,
-        _conn: &Connection,
+    fn create_monitor_meta(&self, output: &wl_output::WlOutput) -> anyhow::Result<MonitorMeta> {
+        let output_info = self
+            .output_state
+            .info(output)
+            .context("Failed to get output info")?;
+        let monitor_name = output_info
+            .name
+            .context("Failed to get monitor_name")?
+            .clone();
+        let (width, height) = output_info
+            .logical_size
+            .context("Failed to get monitor width and height")?;
+
+        Ok(MonitorMeta { name: monitor_name, width, height })
+    }
+
+    fn create_layer_shell(
+        &self,
         qh: &QueueHandle<Self>,
-        surface: &wl_surface::WlSurface,
-        _time: u32,
-    ) {
-        self.render(qh, surface, false).unwrap();
+        output: &wl_output::WlOutput,
+        monitor_meta: &MonitorMeta
+    ) -> LayerSurface {
+        let surface = self.compositor_state.create_surface(qh);
+        let layer = self.layer_shell.create_layer_surface(
+            qh,
+            surface,
+            Layer::Background,
+            Some("background_layer"),
+            Some(output),
+        );
+        layer.set_anchor(Anchor::BOTTOM);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+        layer.set_size(monitor_meta.width as u32, monitor_meta.height as u32);
+        layer.commit();
+        layer
     }
 
-    fn surface_enter(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
-        _output: &wl_output::WlOutput,
-    ) {
-        // Not needed for this example.
+
+    pub fn run(&mut self) -> anyhow::Result<()> {
+        let Some(mut evt_queue) = self.event_queue.take() else {
+            return Ok(());
+        };
+        tracing::info!("Running Layer");
+
+        evt_queue.roundtrip(self)?;
+
+        loop {
+            evt_queue.blocking_dispatch(self)?;
+        }
     }
 
-    fn surface_leave(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
-        _output: &wl_output::WlOutput,
-    ) {
-        // Not needed for this example.
-    }
 }
-
-impl OutputHandler for WallpaperLayer {
-    fn output_state(&mut self) -> &mut OutputState {
-        &mut self.output_state
-    }
-
-    fn new_output(
-        &mut self,
-        _conn: &Connection,
-        qh: &QueueHandle<Self>,
-        output: wl_output::WlOutput,
-    ) {
-        self.handle_new_output(qh, output).unwrap();
-    }
-
-    fn update_output(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _output: wl_output::WlOutput,
-    ) {
-    }
-
-    fn output_destroyed(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _output: wl_output::WlOutput,
-    ) {
-    }
-}
-
-impl LayerShellHandler for WallpaperLayer {
-    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _layer: &LayerSurface) {}
-
-    fn configure(
-        &mut self,
-        _conn: &Connection,
-        qh: &QueueHandle<Self>,
-        layer: &LayerSurface,
-        _configure: LayerSurfaceConfigure,
-        _serial: u32,
-    ) {
-        self.render(qh, layer.wl_surface(), true).unwrap();
-    }
-}
-
-impl SeatHandler for WallpaperLayer {
-    fn seat_state(&mut self) -> &mut SeatState {
-        &mut self.seat_state
-    }
-
-    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
-
-    fn new_capability(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: wl_seat::WlSeat,
-        _: Capability,
-    ) {
-    }
-
-    fn remove_capability(
-        &mut self,
-        _conn: &Connection,
-        _: &QueueHandle<Self>,
-        _: wl_seat::WlSeat,
-        _: Capability,
-    ) {
-    }
-
-    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
-}
-
-impl KeyboardHandler for WallpaperLayer {
-    fn enter(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: &wl_surface::WlSurface,
-        _: u32,
-        _: &[u32],
-        _: &[Keysym],
-    ) {
-    }
-
-    fn leave(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: &wl_surface::WlSurface,
-        _: u32,
-    ) {
-    }
-
-    fn press_key(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: u32,
-        _event: KeyEvent,
-    ) {
-    }
-
-    fn repeat_key(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _keyboard: &wl_keyboard::WlKeyboard,
-        _serial: u32,
-        event: KeyEvent,
-    ) {
-        println!("Key repeat: {event:?}");
-    }
-
-    fn release_key(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: u32,
-        event: KeyEvent,
-    ) {
-        println!("Key release: {event:?}");
-    }
-
-    fn update_modifiers(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _serial: u32,
-        modifiers: Modifiers,
-        _raw_modifiers: RawModifiers,
-        _layout: u32,
-    ) {
-        println!("Update modifiers: {modifiers:?}");
-    }
-}
-
-impl PointerHandler for WallpaperLayer {
-    fn pointer_frame(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _pointer: &wl_pointer::WlPointer,
-        _events: &[PointerEvent],
-    ) {
-    }
-}
-
-impl ShmHandler for WallpaperLayer {
-    fn shm_state(&mut self) -> &mut Shm {
-        &mut self.shm
-    }
-}
-
-impl ProvidesRegistryState for WallpaperLayer {
-    fn registry(&mut self) -> &mut RegistryState {
-        &mut self.registry_state
-    }
-    registry_handlers![OutputState, SeatState];
-}
-
-delegate_compositor!(WallpaperLayer);
-delegate_output!(WallpaperLayer);
-delegate_seat!(WallpaperLayer);
-delegate_keyboard!(WallpaperLayer);
-delegate_pointer!(WallpaperLayer);
-delegate_shm!(WallpaperLayer);
-
-delegate_layer!(WallpaperLayer);
-
-delegate_registry!(WallpaperLayer);
