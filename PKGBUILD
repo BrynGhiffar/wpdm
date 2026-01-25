@@ -17,6 +17,8 @@ prepare() {
 
 build() {
 	cd "$startdir"
+	echo "RUSTC_VERSION: $(rustc --version)"
+	echo "CARGO_VERSION: $(cargo --version)"
 	export RUSTUP_TOOLCHAIN=stable
 	export CARGO_TARGET_DIR=target
 	cargo build --frozen --release --all-features
