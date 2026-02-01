@@ -1,3 +1,3 @@
 # WPDM
 
-A wayland wallpaper daemon
+A bad copycat of the awww wayland wallpaper manager.

@@ -1,12 +1,10 @@
 pub mod serde_udp;
 pub mod config;
 
-use anyhow::anyhow;
-
 use crate::serde_udp::SerdeUdp;
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
-pub struct WpdmSetWallpaper {
+pub struct WallpaperCmd {
     pub path: String,
     pub monitors: Vec<String>
 }
@@ -24,28 +22,27 @@ pub struct WpdmMonitors {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
-pub enum WpdmMessage {
-    SetWallpaper(WpdmSetWallpaper),
-    QueryMonitor,
+pub enum CliRequest {
+    WallpaperCmd(WallpaperCmd),
+    MonitorQuery,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub enum CliResponse {
     Monitors(WpdmMonitors)
 }
 
-impl WpdmMessage {
-    pub fn set_wallpaper(path: String, monitors: Vec<String>) -> Self {
-        Self::SetWallpaper(WpdmSetWallpaper { path, monitors })
+mod cmd {
+    use super::*;
+
+    pub fn wallpaper(path: String, monitors: Vec<String>) -> CliRequest {
+        CliRequest::WallpaperCmd(WallpaperCmd { path, monitors })
     }
 }
 
 pub struct WpdmClient {
-    stream: SerdeUdp<WpdmMessage>,
+    stream: SerdeUdp<CliRequest, CliResponse>,
 }
-
-// Problems:
-// 1. We want to process image on the client.
-// 2. How do we tell the client about the monitor size?
-// 3. Need bidirectional communication. (Server also needs to be able to send message to client)
-// 4. Means server has to manage connection to clients?
-//      No, server can just use broadcast, will assume that there is only a single client.
 
 impl WpdmClient {
     pub fn new() -> anyhow::Result<Self> {
@@ -54,30 +51,20 @@ impl WpdmClient {
     }
 
     pub fn set_wallpaper(&mut self, path: String, monitors: Vec<String>) -> anyhow::Result<()> {
-        let message = WpdmMessage::set_wallpaper(path, monitors);
-
-        self.stream.send(message)
-            .inspect_err(|err| tracing::error!("Failed to send set wallpaper: {}", err))?;
-
+        let message = cmd::wallpaper(path, monitors);
+        self.stream.send(message)?;
         Ok(())
     }
 
     pub fn get_monitors(&mut self) -> anyhow::Result<Vec<WpdmMonitor>> {
-        self.stream.send(WpdmMessage::QueryMonitor)
-            .inspect_err(|err| tracing::error!("Failed to send set wallpaper: {}", err))?;
-
-        let message = self.stream.recv()?;
-
-        let WpdmMessage::Monitors(WpdmMonitors { monitors }) = message else {
-            return Err(anyhow!("Server didn't return correct response"));
-        };
-
-        Ok(monitors)
+        let CliResponse::Monitors(mon) = self.stream
+            .send_recv(CliRequest::MonitorQuery)?;
+        Ok(mon.monitors)
     }
 }
 
 pub struct WpdmListener {
-    listener: SerdeUdp<WpdmMessage>,
+    listener: SerdeUdp<CliResponse, CliRequest>,
 }
 
 impl WpdmListener {
@@ -87,12 +74,12 @@ impl WpdmListener {
     }
 
     pub fn monitors(&mut self, monitors: Vec<WpdmMonitor>) -> anyhow::Result<()> {
-        let message = WpdmMessage::Monitors(WpdmMonitors { monitors });
+        let message = CliResponse::Monitors(WpdmMonitors { monitors });
         self.listener.send(message)?;
         Ok(())
     }
 
-    pub fn poll(&mut self) -> anyhow::Result<WpdmMessage> {
+    pub fn poll(&mut self) -> anyhow::Result<CliRequest> {
         Ok(self.listener.recv()?)
     }
 }

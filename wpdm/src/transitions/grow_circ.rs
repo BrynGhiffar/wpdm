@@ -16,7 +16,7 @@ pub struct GrowCircleTransition {
 
 impl GrowCircleTransition {
     pub fn new(width: u32, height: u32) -> Self {
-        Self::new_with_frames(width, height, 40)
+        Self::new_with_frames(width, height, 60)
     }
 
     pub fn new_with_frames(width: u32, height: u32, n_frames: u32) -> Self {
@@ -25,9 +25,14 @@ impl GrowCircleTransition {
         let origin_x = f32_width.div(2.0);
         let origin_y = f32_height.div(2.0);
 
-        let max_radius = [(0.0, 0.0), (0.0, f32_height), (f32_width, 0.0), (f32_width, f32_height)]
-            .into_iter()
-            .flat_map(|(x, y)| f32::l2sq(&[x, y], &[origin_x, origin_y])).fold(f64::NEG_INFINITY, f64::max) as f32;
+        let max_radius = [
+            (0.0, 0.0),
+            (0.0, f32_height),
+            (f32_width, 0.0),
+            (f32_width, f32_height)
+        ]
+        .into_iter()
+        .flat_map(|(x, y)| f32::l2sq(&[x, y], &[origin_x, origin_y])).fold(f64::NEG_INFINITY, f64::max) as f32;
 
         GrowCircleTransition { width, height, origin_x, origin_y, max_radius, n_frames }
     }

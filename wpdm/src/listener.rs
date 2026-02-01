@@ -4,21 +4,21 @@ use std::{fs::OpenOptions, io::Read, thread::JoinHandle};
 
 use anyhow::Context;
 use wpdm_common::config::save_wp_path;
-use wpdm_common::{config, WpdmListener, WpdmMonitor, WpdmSetWallpaper};
+use wpdm_common::{CliRequest, WallpaperCmd, WpdmListener, WpdmMonitor, config};
 
-use crate::layer::RenderCommand;
+use crate::cmd::{RenderCmd, RenderCmdTy, RenderTrOrigin};
 use crate::{layer::SharedMonitorMeta};
 
 pub struct WpdmServer {
     // Needs to know dimensions of the buffer to send
     listener: WpdmListener,
-    producer: mpsc::SyncSender<RenderCommand>,
+    producer: mpsc::SyncSender<RenderCmd>,
     monitor_meta: SharedMonitorMeta,
 }
 
 impl WpdmServer {
     pub fn new(
-        producer: mpsc::SyncSender<RenderCommand>,
+        producer: mpsc::SyncSender<RenderCmd>,
         monitor_meta: SharedMonitorMeta,
     ) -> anyhow::Result<Self> {
         Ok(Self {
@@ -34,7 +34,7 @@ impl WpdmServer {
         }
     }
 
-    pub fn handle_change_wallpaper(&mut self, sw: WpdmSetWallpaper) -> anyhow::Result<()> {
+    pub fn handle_change_wallpaper(&mut self, sw: WallpaperCmd) -> anyhow::Result<()> {
         // 1. Generate all frames for wallpaper change
         // 2. Fetch current wallpaper (need wallpaper image loader, since we don't store current
         //    wallpaper in memory)
@@ -43,10 +43,12 @@ impl WpdmServer {
         let dest_argb_buff_path = Path::new(&sw.path).to_owned();
         let monitors = sw.monitors;
 
-        self.producer.send(RenderCommand::Transition {
+        self.producer.send(RenderCmd {
             monitors,
             src_argb_buff_path,
-            dest_argb_buff_path
+            dest_argb_buff_path,
+            tr_ty: RenderCmdTy::CircleTr,
+            origin: RenderTrOrigin::Center,
         })
         .inspect_err(|e| tracing::error!("Failed sending buffer: {}", e))?;
 
@@ -73,7 +75,8 @@ impl WpdmServer {
             let metas = self.monitor_meta.read().unwrap();
             metas.iter().map(|mm| mm.name.clone()).collect()
         };
-        self.handle_change_wallpaper(WpdmSetWallpaper { path, monitors })?;
+        self.handle_change_wallpaper(WallpaperCmd { path, monitors })?;
+
         Ok(())
     }
 
@@ -87,12 +90,12 @@ impl WpdmServer {
             };
 
             match message {
-                wpdm_common::WpdmMessage::SetWallpaper(set_wallpaper) => {
+                CliRequest::WallpaperCmd(set_wallpaper) => {
                     if let Err(err) = self.handle_change_wallpaper(set_wallpaper) {
                         tracing::error!("Error during change wallpaper: {}", err);
                     }
                 },
-                wpdm_common::WpdmMessage::QueryMonitor => {
+                CliRequest::MonitorQuery => {
                     let monitor_metas = self.monitor_meta.read().unwrap();
                     let monitors = monitor_metas.iter()
                         .map(|mm| WpdmMonitor { name: mm.name.clone(), height: mm.height, width: mm.width })
@@ -100,9 +103,6 @@ impl WpdmServer {
                     let _ = self.listener.monitors(monitors)
                         .inspect_err(|err| tracing::error!("Failed to send monitors: {}", err));
                 },
-
-                // Client side messages
-                wpdm_common::WpdmMessage::Monitors(_) => { }
             };
         }
     }

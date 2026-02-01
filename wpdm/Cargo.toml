@@ -16,3 +16,7 @@ gcd = { workspace = true }
 simsimd = { workspace = true }
 libc = "0.2"
 memmap2 = "0.9"
+
+[profile.release]
+strip = true
+opt-level = "z"

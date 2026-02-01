@@ -2,6 +2,7 @@ use std::{fs::{File, OpenOptions}, io::Read, path::PathBuf};
 
 use memmap2::Mmap;
 
+#[allow(unused)]
 pub fn load_argb_buffer(path: PathBuf) -> anyhow::Result<Vec<u8>> {
     let mut file = File::open(path)?;
     let mut contents = Vec::new();

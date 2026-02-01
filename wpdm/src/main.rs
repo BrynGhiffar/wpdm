@@ -7,6 +7,7 @@ mod transitions;
 mod renderer;
 mod util;
 mod handler;
+mod cmd;
 
 use std::sync::mpsc;
 
