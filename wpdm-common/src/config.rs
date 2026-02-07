@@ -1,5 +1,8 @@
+use std::path::Path;
 use std::{fs::OpenOptions, path::PathBuf};
 use std::io::Write;
+
+use anyhow::Context;
 
 pub fn config_path() -> Option<PathBuf> {
     Some(
@@ -12,7 +15,7 @@ pub fn config_dir() -> Option<PathBuf> {
     config_path()?.parent().map(|p| p.to_path_buf())
 }
 
-pub fn save_wp_path(path: &str) -> std::io::Result<()> {
+pub fn save_wp_path(path: &Path) -> anyhow::Result<()> {
     let Some(dir) = config_dir() else {
         return Ok(())
     };
@@ -26,7 +29,7 @@ pub fn save_wp_path(path: &str) -> std::io::Result<()> {
         .truncate(true)
         .open(conf_path)?;
 
-    writeln!(save, "{}", path)?;
+    writeln!(save, "{}", path.to_str().context("to_str failed")?)?;
     Ok(())
 }
 

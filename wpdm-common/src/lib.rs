@@ -1,11 +1,14 @@
 pub mod serde_udp;
 pub mod config;
+pub mod disk_state;
+
+use std::path::PathBuf;
 
 use crate::serde_udp::SerdeUdp;
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct WallpaperCmd {
-    pub path: String,
+    pub path: PathBuf,
     pub monitors: Vec<String>
 }
 
@@ -35,7 +38,7 @@ pub enum CliResponse {
 mod cmd {
     use super::*;
 
-    pub fn wallpaper(path: String, monitors: Vec<String>) -> CliRequest {
+    pub fn wallpaper(path: PathBuf, monitors: Vec<String>) -> CliRequest {
         CliRequest::WallpaperCmd(WallpaperCmd { path, monitors })
     }
 }
@@ -50,7 +53,7 @@ impl WpdmClient {
         Ok(Self { stream })
     }
 
-    pub fn set_wallpaper(&mut self, path: String, monitors: Vec<String>) -> anyhow::Result<()> {
+    pub fn set_wallpaper(&mut self, path: PathBuf, monitors: Vec<String>) -> anyhow::Result<()> {
         let message = cmd::wallpaper(path, monitors);
         self.stream.send(message)?;
         Ok(())

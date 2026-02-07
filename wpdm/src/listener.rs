@@ -1,10 +1,9 @@
-use std::path::Path;
 use std::sync::mpsc;
-use std::{fs::OpenOptions, io::Read, thread::JoinHandle};
+use std::thread::JoinHandle;
 
 use anyhow::Context;
-use wpdm_common::config::save_wp_path;
-use wpdm_common::{CliRequest, WallpaperCmd, WpdmListener, WpdmMonitor, config};
+use wpdm_common::disk_state::DiskState;
+use wpdm_common::{CliRequest, WallpaperCmd, WpdmListener, WpdmMonitor};
 
 use crate::cmd::{RenderCmd, RenderCmdTy, RenderTrOrigin};
 use crate::{layer::SharedMonitorMeta};
@@ -39,8 +38,9 @@ impl WpdmServer {
         // 2. Fetch current wallpaper (need wallpaper image loader, since we don't store current
         //    wallpaper in memory)
         // 3. Generate frame transitions between set_wallpaper
-        let src_argb_buff_path = Path::new(&self.get_curr_wp_path()?).to_owned();
-        let dest_argb_buff_path = Path::new(&sw.path).to_owned();
+        let src_argb_buff_path = DiskState::get_curr_wp()
+            .unwrap_or_else(|_| sw.path.clone());
+        let dest_argb_buff_path = sw.path.clone();
         let monitors = sw.monitors;
 
         self.producer.send(RenderCmd {
@@ -53,22 +53,13 @@ impl WpdmServer {
         .inspect_err(|e| tracing::error!("Failed sending buffer: {}", e))?;
 
         // TODO: Save path needs to run on wpdm-cli
-        save_wp_path(&sw.path)?;
+        DiskState::try_save_wp(&sw.path)?;
 
         Ok(())
     }
 
-    pub fn get_curr_wp_path(&self) -> anyhow::Result<String> {
-        let path = config::config_path().context("Failed to get config path")?;
-        let mut data_file = OpenOptions::new().read(true).open(path)?;
-        let mut path = String::new();
-        let _ = data_file.read_to_string(&mut path)?;
-        let path = path.trim().to_string();
-        Ok(path)
-    }
-
     pub fn on_start(&mut self) -> anyhow::Result<()> {
-        let path = self.get_curr_wp_path()?;
+        let path = DiskState::get_curr_wp()?;
         self.wait_for_monitors();
         tracing::info!("Finished waiting for monitors, {:?}", &path);
         let monitors = { 
@@ -76,7 +67,6 @@ impl WpdmServer {
             metas.iter().map(|mm| mm.name.clone()).collect()
         };
         self.handle_change_wallpaper(WallpaperCmd { path, monitors })?;
-
         Ok(())
     }
 
