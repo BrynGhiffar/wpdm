@@ -57,8 +57,7 @@ impl WpdmClient {
     }
 
     pub fn get_monitors(&mut self) -> anyhow::Result<Vec<WpdmMonitor>> {
-        let CliResponse::Monitors(mon) = self.stream
-            .send_recv(CliRequest::MonitorQuery)?;
+        let CliResponse::Monitors(mon) = self.stream.send_recv(CliRequest::MonitorQuery)?;
         Ok(mon.monitors)
     }
 }

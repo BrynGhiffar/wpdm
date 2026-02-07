@@ -13,6 +13,7 @@ use rayon::slice::ParallelSliceMut;
 use sha2::{Digest, Sha256};
 use wpdm_common::config;
 use std::fmt::Write as FmtWrite;
+mod cache;
 
 #[derive(Parser)]
 struct Args {
@@ -87,6 +88,7 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().init();
     let args = Args::parse();
     let mut client = wpdm_common::WpdmClient::new()?;
+
     let image_path = Path::new(&args.image_path).canonicalize()?;
     let image_path_str = image_path.to_str().context("Failed to get string")?;
 
