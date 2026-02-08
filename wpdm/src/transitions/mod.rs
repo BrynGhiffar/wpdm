@@ -37,8 +37,17 @@ impl TransitionAnim {
         Self::Circle(CircleTransition::new_opt(width, height, Some(opt)))
     }
 
-    pub fn wipe(width: u32, height: u32, angle: f32) -> Self {
+    pub fn wipe(width: u32, height: u32, angle: f32, origin: TransitionOrigin) -> Self {
         let n_frames = 60;
+        let angle = {
+            if origin == TransitionOrigin::Random {
+                let mut rng = rand::rng();
+                let angle: u32 = rng.random_range(0..=90);
+                angle as f32
+            } else {
+                angle
+            }
+        };
         Self::Wipe(WipeTransition::new_opt(width, height, Some(WipeTransitionOpt { n_frames, angle })))
     }
 

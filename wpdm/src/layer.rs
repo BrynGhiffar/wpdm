@@ -257,9 +257,8 @@ impl WallpaperLayer {
         }
 
         let transition = match tr_type {
-            wpdm_common::TransitionType::Wipe => TransitionAnim::wipe(width, height, angle),
+            wpdm_common::TransitionType::Wipe => TransitionAnim::wipe(width, height, angle, tr_origin),
             wpdm_common::TransitionType::Circle => TransitionAnim::circle(width, height, tr_origin),
-            // wpdm_common::TransitionType::None => TransitionAnim::circle(width, height, tr_origin)
             wpdm_common::TransitionType::None => TransitionAnim::none(width, height)
         };
 

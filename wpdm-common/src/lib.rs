@@ -13,7 +13,7 @@ pub enum TransitionType {
     None
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransitionOrigin {
     Center,
     Left,
