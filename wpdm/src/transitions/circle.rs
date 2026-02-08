@@ -1,11 +1,9 @@
-use std::ops::Div;
-
 use rayon::{iter::{IndexedParallelIterator,ParallelIterator}, slice::ParallelSliceMut};
 
 use crate::util::{argb_buffer_size};
 use simsimd::SpatialSimilarity;
 
-pub struct GrowCircleTransition {
+pub struct CircleTransition {
     n_frames: u32,
     width: u32,
     height: u32,
@@ -14,16 +12,25 @@ pub struct GrowCircleTransition {
     max_radius: f32,
 }
 
-impl GrowCircleTransition {
-    pub fn new(width: u32, height: u32) -> Self {
-        Self::new_with_frames(width, height, 60)
-    }
+pub struct CircleTransitionOpt {
+    pub origin_x: f32,
+    pub origin_y: f32,
+    pub n_frames: u32
+}
 
-    pub fn new_with_frames(width: u32, height: u32, n_frames: u32) -> Self {
+impl Default for CircleTransitionOpt {
+    fn default() -> Self {
+        Self { origin_x: 0.0, origin_y: 0.0, n_frames: 60 }
+    }
+}
+
+impl CircleTransition {
+    pub fn new_opt(width: u32, height: u32, opts: Option<CircleTransitionOpt>) -> Self {
         let f32_width = width as f32;
         let f32_height = height as f32;
-        let origin_x = f32_width.div(2.0);
-        let origin_y = f32_height.div(2.0);
+        let opts = opts.unwrap_or_default();
+        let origin_x = opts.origin_x;
+        let origin_y = opts.origin_y;
 
         let max_radius = [
             (0.0, 0.0),
@@ -34,7 +41,7 @@ impl GrowCircleTransition {
         .into_iter()
         .flat_map(|(x, y)| f32::l2sq(&[x, y], &[origin_x, origin_y])).fold(f64::NEG_INFINITY, f64::max) as f32;
 
-        GrowCircleTransition { width, height, origin_x, origin_y, max_radius, n_frames }
+        CircleTransition { width, height, origin_x, origin_y, max_radius, n_frames: opts.n_frames }
     }
 
     pub fn render(&self, frame: u32, from: &[u8], to: &[u8], result: &mut [u8]) -> bool {

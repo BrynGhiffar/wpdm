@@ -6,10 +6,29 @@ use std::path::PathBuf;
 
 use crate::serde_udp::SerdeUdp;
 
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy)]
+pub enum TransitionType {
+    Circle,
+    Wipe,
+    None
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy)]
+pub enum TransitionOrigin {
+    Center,
+    Left,
+    Right,
+    Random,
+    Coord(u64, u64),
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct WallpaperCmd {
     pub path: PathBuf,
-    pub monitors: Vec<String>
+    pub monitors: Vec<String>,
+    pub tran_type: TransitionType,
+    pub tran_origin: TransitionOrigin,
+    pub angle: f32,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
@@ -35,14 +54,6 @@ pub enum CliResponse {
     Monitors(WpdmMonitors)
 }
 
-mod cmd {
-    use super::*;
-
-    pub fn wallpaper(path: PathBuf, monitors: Vec<String>) -> CliRequest {
-        CliRequest::WallpaperCmd(WallpaperCmd { path, monitors })
-    }
-}
-
 pub struct WpdmClient {
     stream: SerdeUdp<CliRequest, CliResponse>,
 }
@@ -53,9 +64,8 @@ impl WpdmClient {
         Ok(Self { stream })
     }
 
-    pub fn set_wallpaper(&mut self, path: PathBuf, monitors: Vec<String>) -> anyhow::Result<()> {
-        let message = cmd::wallpaper(path, monitors);
-        self.stream.send(message)?;
+    pub fn send(&mut self, req: CliRequest) -> anyhow::Result<()> {
+        self.stream.send(req)?;
         Ok(())
     }
 

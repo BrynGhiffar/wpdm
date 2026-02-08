@@ -1,27 +1,61 @@
-use std::collections::HashMap;
+use core::fmt;
+
 use clap::Parser;
-use wpdm_common::WpdmMonitor;
+use wpdm_common::{CliRequest, TransitionOrigin, TransitionType, WallpaperCmd};
 
 use crate::cache::CachedImg;
+use crate::util::group_by_size;
 mod cache;
+mod util;
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy)]
+#[clap(rename_all = "kebab-case")]
+enum ArgTransitionType {
+    Circle,
+    Wipe,
+    None
+}
+
+impl std::fmt::Display for ArgTransitionType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            ArgTransitionType::Circle => write!(f, "circle"),
+            ArgTransitionType::Wipe => write!(f, "wipe"),
+            ArgTransitionType::None => write!(f, "none")
+        }
+    }
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy)]
+#[clap(rename_all = "kebab-case")]
+enum ArgTransitionOrigin {
+    Center,
+    Left,
+    Right,
+    Rand
+}
+
+impl ToString for ArgTransitionOrigin {
+    fn to_string(&self) -> String {
+        match self {
+            ArgTransitionOrigin::Center => "center".to_string(),
+            ArgTransitionOrigin::Left => "left".to_string(),
+            ArgTransitionOrigin::Right => "right".to_string(),
+            ArgTransitionOrigin::Rand => "rand".to_string()
+        }
+    }
+}
 
 #[derive(Parser)]
 struct Args {
     #[arg(short, long)]
     image_path: String,
-}
-
-fn group_by_size(monitors: Vec<WpdmMonitor>) -> impl Iterator<Item = (i32, i32, Vec<String>)> {
-    let sizes = monitors.into_iter()
-        .fold(HashMap::<(i32, i32), Vec<String>>::new(), |mut init, nxt| {
-        if let Some(monitors) = init.get_mut(&(nxt.width, nxt.height)) {
-            monitors.push(nxt.name);
-        } else {
-            init.insert((nxt.width, nxt.height), vec![nxt.name]);
-        }
-        init
-    });
-    sizes.into_iter().map(|((width, height), monitors) | (width, height, monitors))
+    #[arg(short, long, default_value_t = ArgTransitionType::Circle)]
+    transition: ArgTransitionType,
+    #[arg(short, long, default_value_t = ArgTransitionOrigin::Center)]
+    origin: ArgTransitionOrigin,
+    #[arg(short, long, default_value_t = 30.0)]
+    angle: f32,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -31,6 +65,18 @@ fn main() -> anyhow::Result<()> {
 
     let mut cached_img = CachedImg::new(&args.image_path)?;
 
+    let tran_type = match args.transition {
+        ArgTransitionType::Circle => TransitionType::Circle,
+        ArgTransitionType::None => TransitionType::None,
+        ArgTransitionType::Wipe => TransitionType::Wipe
+    };
+    let tran_origin = match args.origin {
+        ArgTransitionOrigin::Center => TransitionOrigin::Center,
+        ArgTransitionOrigin::Left => TransitionOrigin::Left,
+        ArgTransitionOrigin::Right => TransitionOrigin::Right,
+        ArgTransitionOrigin::Rand => TransitionOrigin::Random,
+    };
+
     // Get all active monitors
     let monitors = client.get_monitors()?;
 
@@ -38,8 +84,15 @@ fn main() -> anyhow::Result<()> {
     for (width, height, monitors) in group_by_size(monitors) {
         let img_path = cached_img.get_image(width, height)?;
 
-        // Set monitors according to their sizes
-        client.set_wallpaper(img_path, monitors)?;
+        let req = CliRequest::WallpaperCmd(WallpaperCmd {
+            path: img_path,
+            monitors,
+            tran_origin,
+            tran_type,
+            angle: args.angle
+        });
+
+        client.send(req)?;
     }
 
     Ok(())

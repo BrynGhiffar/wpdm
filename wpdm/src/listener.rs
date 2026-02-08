@@ -3,9 +3,9 @@ use std::thread::JoinHandle;
 
 use anyhow::Context;
 use wpdm_common::disk_state::DiskState;
-use wpdm_common::{CliRequest, WallpaperCmd, WpdmListener, WpdmMonitor};
+use wpdm_common::{CliRequest, TransitionOrigin, TransitionType, WallpaperCmd, WpdmListener, WpdmMonitor};
 
-use crate::cmd::{RenderCmd, RenderCmdTy, RenderTrOrigin};
+use crate::cmd::RenderCmd;
 use crate::{layer::SharedMonitorMeta};
 
 pub struct WpdmServer {
@@ -47,8 +47,9 @@ impl WpdmServer {
                 monitor: mon.to_string(),
                 src_argb_buff_path,
                 dest_argb_buff_path,
-                tr_ty: RenderCmdTy::CircleTr,
-                origin: RenderTrOrigin::Center,
+                tr_type: cmd.tran_type.clone(),
+                tr_origin: cmd.tran_origin,
+                angle: cmd.angle
             })
             .inspect_err(|e| tracing::error!("Failed sending buffer: {}", e))?;
 
@@ -68,8 +69,15 @@ impl WpdmServer {
 
         for mon in monitors.iter() {
             let path = DiskState::get_curr_wp(mon)?;
-            // TODO: Need to support initial wallpaper
-            self.handle_change_wallpaper(WallpaperCmd { path, monitors: vec![ mon.to_string() ] })?;
+            self.producer.send(RenderCmd {
+                monitor: mon.to_string(),
+                src_argb_buff_path: path.clone(),
+                dest_argb_buff_path: path.clone(),
+                tr_origin: TransitionOrigin::Center,
+                tr_type: TransitionType::None,
+                angle: 0.0,
+            })
+            .inspect_err(|e| tracing::error!("Failed sending buffer: {}", e))?;
         }
         Ok(())
     }

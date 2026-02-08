@@ -1787,6 +1787,7 @@ dependencies = [
  "gcd",
  "libc",
  "memmap2",
+ "rand",
  "rayon",
  "rtrb",
  "simsimd",

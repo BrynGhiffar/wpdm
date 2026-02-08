@@ -27,7 +27,7 @@ use wayland_client::{
 
 use std::sync::mpsc::Receiver;
 
-use crate::{cmd::RenderCmd, transitions::grow_circ::GrowCircleTransition};
+use crate::{cmd::RenderCmd, transitions::TransitionAnim};
 
 #[allow(unused)]
 use crate::loader::load_argb_buffer;
@@ -55,7 +55,7 @@ pub struct Transition {
     frame: u32,
     from_buffer: Mmap,
     to_buffer: Mmap,
-    transition: GrowCircleTransition
+    transition: TransitionAnim
 }
 
 pub struct TransitionManager {
@@ -222,7 +222,14 @@ impl WallpaperLayer {
                 self.cons.try_recv().context("Try Recv Err")
             }
         };
-        let Ok(RenderCmd { monitor, src_argb_buff_path, dest_argb_buff_path, .. }) = recv() else {
+        let Ok(RenderCmd {
+            monitor,
+            src_argb_buff_path,
+            dest_argb_buff_path,
+            tr_type,
+            tr_origin,
+            angle
+        }) = recv() else {
             return;
         };
 
@@ -249,10 +256,17 @@ impl WallpaperLayer {
             return;
         }
 
+        let transition = match tr_type {
+            wpdm_common::TransitionType::Wipe => TransitionAnim::wipe(width, height, angle),
+            wpdm_common::TransitionType::Circle => TransitionAnim::circle(width, height, tr_origin),
+            // wpdm_common::TransitionType::None => TransitionAnim::circle(width, height, tr_origin)
+            wpdm_common::TransitionType::None => TransitionAnim::none(width, height)
+        };
+
         let tr = Transition {
             frame: 0,
             monitor,
-            transition: GrowCircleTransition::new(width, height),
+            transition,
             from_buffer,
             to_buffer
         };
