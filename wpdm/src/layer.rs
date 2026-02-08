@@ -70,16 +70,19 @@ impl TransitionManager {
     fn render_transition(&mut self, monitor: &str, buffer: &mut [u8]) -> Option<()> {
         let tr_idx = self.transitions.iter()
             .position(|tr| tr.monitor.eq(monitor))?;
+
+        // No monitor is left behind!
+        let frame = self.transitions.iter().map(|tr| tr.frame).min()?;
         let tr = self.transitions.get_mut(tr_idx)?;
 
         let ret = tr.transition.render(
-            tr.frame, 
+            frame, 
             &tr.from_buffer, 
             &tr.to_buffer, 
             buffer
         );
         if !ret {
-            tr.frame += 1;
+            tr.frame = frame + 1;
         } else {
             self.transitions.remove(tr_idx);
         }
@@ -192,6 +195,7 @@ impl WallpaperLayer {
         let has_transitions = transition_manager.has_transitions();
         self.transition_manager.replace(transition_manager);
         self.flush_buffer(&buffer, &monitor)?;
+
         self.request_render(qh, &monitor);
 
         if !has_transitions {
