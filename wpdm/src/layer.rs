@@ -1,6 +1,6 @@
 extern crate libc;
 
-use std::{collections::BTreeMap, sync::{Arc, RwLock}};
+use std::sync::{Arc, RwLock};
 
 use anyhow::Context;
 use memmap2::Mmap;
@@ -51,8 +51,8 @@ pub struct Monitor {
 }
 
 pub struct Transition {
-    monitors: Vec<String>,
-    frames: Vec<u32>,
+    monitor: String,
+    frame: u32,
     from_buffer: Mmap,
     to_buffer: Mmap,
     transition: GrowCircleTransition
@@ -69,28 +69,18 @@ impl TransitionManager {
     
     fn render_transition(&mut self, monitor: &str, buffer: &mut [u8]) -> Option<()> {
         let tr_idx = self.transitions.iter()
-            .position(|tr| tr.monitors.iter()
-                .any(|ss| ss.as_str().eq(monitor)))?;
+            .position(|tr| tr.monitor.eq(monitor))?;
         let tr = self.transitions.get_mut(tr_idx)?;
-        let idx = tr.monitors.iter().position(|tr| tr.as_str().eq(monitor))?;
-        let curr_frame = tr.frames.get_mut(idx)?;
 
         let ret = tr.transition.render(
-            *curr_frame, 
+            tr.frame, 
             &tr.from_buffer, 
             &tr.to_buffer, 
             buffer
         );
         if !ret {
-            *curr_frame += 1;
+            tr.frame += 1;
         } else {
-            // If monitor has finished transition, remove monitor from monitors
-            tr.monitors.remove(idx);
-            tr.frames.remove(idx);
-        }
-
-        if tr.monitors.is_empty() {
-            tracing::info!("Removing transition!");
             self.transitions.remove(tr_idx);
         }
         Some(())
@@ -212,62 +202,59 @@ impl WallpaperLayer {
                 tracing::info!("No memory could be released, or the function is not available on this platform.");
             }
 
-            self.wait_for_commands();
+            self.wait_for_commands(true);
+        } else {
+            self.wait_for_commands(false);
         }
-
 
         Ok(())
     }
 
-    fn wait_for_commands(&mut self) {
-        let Ok(RenderCmd { monitors, src_argb_buff_path, dest_argb_buff_path, .. }) = self.cons.recv() else {
+    fn wait_for_commands(&mut self, blocking: bool) {
+        let recv = || {
+            if blocking {
+                self.cons.recv().context("Recv err")
+            } else {
+                self.cons.try_recv().context("Try Recv Err")
+            }
+        };
+        let Ok(RenderCmd { monitor, src_argb_buff_path, dest_argb_buff_path, .. }) = recv() else {
             return;
         };
 
-        // Possible to cater for more complicated transition types
-        let mut map = BTreeMap::<(u32, u32), Vec<String>>::new();
-        for mon in monitors {
-            let Some((width, height)) = self.get_monitor_size(&mon) else {
-                continue;
-            };
-            if let Some(mons) = map.get_mut(&(width, height)) {
-                mons.push(mon);
-            } else {
-                map.insert((width, height), vec![mon]);
-            }
-        }
+        let Some((width, height)) = self.get_monitor_size(&monitor) else {
+            return;
+        };
 
         // Only expected to loop once, since message from upstream, must be one message,
         // per monitor size
-        for ((width, height), monitors) in map {
-            let Ok(from_buffer) = mmap_buffer(src_argb_buff_path.clone()) else {
-                return;
-            };
-            let Ok(to_buffer) = mmap_buffer(dest_argb_buff_path.clone()) else {
-                return;
-            };
-            let expected_buffer_len = (width * height * 4) as usize;
-            if from_buffer.len() != expected_buffer_len {
-                tracing::error!("Failed to create transition, since from buffer len is unexpected size: {}", from_buffer.len());
-                continue;
-            }
+        let Ok(from_buffer) = mmap_buffer(src_argb_buff_path.clone()) else {
+            return;
+        };
+        let Ok(to_buffer) = mmap_buffer(dest_argb_buff_path.clone()) else {
+            return;
+        };
+        let expected_buffer_len = (width * height * 4) as usize;
+        if from_buffer.len() != expected_buffer_len {
+            tracing::error!("Failed to create transition, since from buffer len is unexpected size: {}", from_buffer.len());
+            return;
+        }
 
-            if to_buffer.len() != expected_buffer_len {
-                tracing::error!("Failed to create transition, since to buffer len is unexpected size: {}", to_buffer.len());
-                continue;
-            }
+        if to_buffer.len() != expected_buffer_len {
+            tracing::error!("Failed to create transition, since to buffer len is unexpected size: {}", to_buffer.len());
+            return;
+        }
 
-            let tr = Transition {
-                frames: vec![0; monitors.len()],
-                monitors,
-                transition: GrowCircleTransition::new(width, height),
-                from_buffer,
-                to_buffer
-            };
+        let tr = Transition {
+            frame: 0,
+            monitor,
+            transition: GrowCircleTransition::new(width, height),
+            from_buffer,
+            to_buffer
+        };
 
-            if let Some(trm) = self.transition_manager.as_mut() {
-                trm.transitions.push(tr);
-            }
+        if let Some(trm) = self.transition_manager.as_mut() {
+            trm.transitions.push(tr);
         }
     }
 

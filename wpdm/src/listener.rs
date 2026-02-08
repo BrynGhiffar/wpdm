@@ -33,40 +33,44 @@ impl WpdmServer {
         }
     }
 
-    pub fn handle_change_wallpaper(&mut self, sw: WallpaperCmd) -> anyhow::Result<()> {
-        // 1. Generate all frames for wallpaper change
-        // 2. Fetch current wallpaper (need wallpaper image loader, since we don't store current
-        //    wallpaper in memory)
-        // 3. Generate frame transitions between set_wallpaper
-        let src_argb_buff_path = DiskState::get_curr_wp()
-            .unwrap_or_else(|_| sw.path.clone());
-        let dest_argb_buff_path = sw.path.clone();
-        let monitors = sw.monitors;
+    pub fn handle_change_wallpaper(&mut self, cmd: WallpaperCmd) -> anyhow::Result<()> {
+        // For each monitor:
+        // 1. Get current wallpaper on each monitor
+        // 2. Create a render command from the monitor's current wallpaper
+        // 3. To the new wallpaper from the command
+        for mon in cmd.monitors {
+            let src_argb_buff_path = DiskState::get_curr_wp(&mon)
+                .unwrap_or_else(|_| cmd.path.clone());
 
-        self.producer.send(RenderCmd {
-            monitors,
-            src_argb_buff_path,
-            dest_argb_buff_path,
-            tr_ty: RenderCmdTy::CircleTr,
-            origin: RenderTrOrigin::Center,
-        })
-        .inspect_err(|e| tracing::error!("Failed sending buffer: {}", e))?;
+            let dest_argb_buff_path = cmd.path.clone();
+            self.producer.send(RenderCmd {
+                monitor: mon.to_string(),
+                src_argb_buff_path,
+                dest_argb_buff_path,
+                tr_ty: RenderCmdTy::CircleTr,
+                origin: RenderTrOrigin::Center,
+            })
+            .inspect_err(|e| tracing::error!("Failed sending buffer: {}", e))?;
 
-        // TODO: Save path needs to run on wpdm-cli
-        DiskState::try_save_wp(&sw.path)?;
+            DiskState::try_save_wp(&mon, &cmd.path)?;
+        }
+
 
         Ok(())
     }
 
     pub fn on_start(&mut self) -> anyhow::Result<()> {
-        let path = DiskState::get_curr_wp()?;
         self.wait_for_monitors();
-        tracing::info!("Finished waiting for monitors, {:?}", &path);
-        let monitors = { 
+        let monitors: Vec<_> = { 
             let metas = self.monitor_meta.read().unwrap();
             metas.iter().map(|mm| mm.name.clone()).collect()
         };
-        self.handle_change_wallpaper(WallpaperCmd { path, monitors })?;
+
+        for mon in monitors.iter() {
+            let path = DiskState::get_curr_wp(mon)?;
+            // TODO: Need to support initial wallpaper
+            self.handle_change_wallpaper(WallpaperCmd { path, monitors: vec![ mon.to_string() ] })?;
+        }
         Ok(())
     }
 
@@ -107,8 +111,8 @@ pub struct WpdmServerHandle(JoinHandle<()>);
 
 impl WpdmServerHandle {
     pub fn wait(self) -> anyhow::Result<()> {
-        self.0
-            .join()
+        let Self(handle) = self;
+        handle.join()
             .ok()
             .context("Issue in running joining WpdmServer thread")
     }

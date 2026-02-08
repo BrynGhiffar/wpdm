@@ -1,4 +1,4 @@
-use std::{fs::OpenOptions, io::{BufReader, BufWriter}, path::{Path, PathBuf}};
+use std::{collections::HashMap, fs::OpenOptions, io::{BufReader, BufWriter}, path::{Path, PathBuf}};
 
 use anyhow::Context;
 
@@ -7,12 +7,12 @@ use crate::config::{self, config_dir, config_path};
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct DiskState {
-    pub curr_wp: Option<PathBuf>
+    pub curr_wp: HashMap<String, PathBuf>
 }
 
 impl DiskState {
     fn empty() -> Self {
-        Self { curr_wp: None } 
+        Self { curr_wp: HashMap::new() } 
     }
 
     pub fn try_load() -> anyhow::Result<Self> {
@@ -31,14 +31,14 @@ impl DiskState {
         Self::try_load().unwrap_or_else(|_| Self::empty())
     }
 
-    pub fn get_curr_wp() -> anyhow::Result<PathBuf> {
+    pub fn get_curr_wp(monitor: &str) -> anyhow::Result<PathBuf> {
         let ds = Self::load();
-        ds.curr_wp.context("No Wallpaper")
+        ds.curr_wp.get(monitor).cloned().context("No Wallpaper")
     }
 
-    pub fn try_save_wp(path: &Path) -> anyhow::Result<()> {
+    pub fn try_save_wp(monitor: &str, path: &Path) -> anyhow::Result<()> {
         let mut ds = Self::load();
-        ds.curr_wp = Some(path.to_path_buf());
+        ds.curr_wp.insert(monitor.to_string(), path.to_path_buf());
         ds.try_save()?;
         Ok(())
     }
