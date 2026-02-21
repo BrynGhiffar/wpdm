@@ -47,7 +47,7 @@ impl WpdmServer {
                 monitor: mon.to_string(),
                 src_argb_buff_path,
                 dest_argb_buff_path,
-                tr_type: cmd.tran_type.clone(),
+                tr_type: cmd.tran_type,
                 tr_origin: cmd.tran_origin,
                 angle: cmd.angle
             })

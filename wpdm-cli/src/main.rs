@@ -1,4 +1,5 @@
 use core::fmt;
+use std::fmt::Display;
 
 use clap::Parser;
 use wpdm_common::{CliRequest, TransitionOrigin, TransitionType, WallpaperCmd};
@@ -35,13 +36,13 @@ enum ArgTransitionOrigin {
     Rand
 }
 
-impl ToString for ArgTransitionOrigin {
-    fn to_string(&self) -> String {
+impl Display for ArgTransitionOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ArgTransitionOrigin::Center => "center".to_string(),
-            ArgTransitionOrigin::Left => "left".to_string(),
-            ArgTransitionOrigin::Right => "right".to_string(),
-            ArgTransitionOrigin::Rand => "rand".to_string()
+            ArgTransitionOrigin::Center => write!(f, "center"),
+            ArgTransitionOrigin::Left => write!(f, "left"),
+            ArgTransitionOrigin::Right => write!(f, "right"),
+            ArgTransitionOrigin::Rand => write!(f, "rand")
         }
     }
 }

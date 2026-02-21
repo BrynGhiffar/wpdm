@@ -10,19 +10,18 @@ use smithay_client_toolkit::{
     registry::RegistryState,
     seat::SeatState,
     shell::{
-        wlr_layer::{
-            Anchor, KeyboardInteractivity, Layer, LayerShell, LayerSurface,
-        }, WaylandSurface
+        WaylandSurface,
+        wlr_layer::{Anchor, KeyboardInteractivity, Layer, LayerShell, LayerSurface},
     },
-    shm::{slot::{Buffer, SlotPool}, Shm},
+    shm::{
+        Shm,
+        slot::{Buffer, SlotPool},
+    },
 };
 use wayland_client::{
     Connection, EventQueue, QueueHandle,
     globals::registry_queue_init,
-    protocol::{
-        wl_output, wl_shm,
-        wl_surface::WlSurface,
-    },
+    protocol::{wl_output, wl_shm, wl_surface::WlSurface},
 };
 
 use std::sync::mpsc::Receiver;
@@ -40,14 +39,13 @@ pub struct MonitorMeta {
     pub height: i32,
 }
 
-
 #[derive(Clone)]
 pub struct Monitor {
     pub name: String,
     pub layer: LayerSurface,
     pub width: i32,
     pub height: i32,
-    pub configured: bool
+    pub configured: bool,
 }
 
 pub struct Transition {
@@ -55,7 +53,7 @@ pub struct Transition {
     frame: u32,
     from_buffer: Mmap,
     to_buffer: Mmap,
-    transition: TransitionAnim
+    transition: TransitionAnim,
 }
 
 pub struct TransitionManager {
@@ -64,27 +62,34 @@ pub struct TransitionManager {
 
 impl TransitionManager {
     fn new() -> Self {
-        Self { transitions: vec![] }
+        Self {
+            transitions: vec![],
+        }
     }
-    
+
     fn render_transition(&mut self, monitor: &str, buffer: &mut [u8]) -> Option<()> {
-        let tr_idx = self.transitions.iter()
+        let tr_idx = self
+            .transitions
+            .iter()
             .position(|tr| tr.monitor.eq(monitor))?;
 
         // No monitor is left behind!
         let frame = self.transitions.iter().map(|tr| tr.frame).min()?;
         let tr = self.transitions.get_mut(tr_idx)?;
 
-        let ret = tr.transition.render(
-            frame, 
-            &tr.from_buffer, 
-            &tr.to_buffer, 
-            buffer
-        );
+        let ret = tr
+            .transition
+            .render(frame, &tr.from_buffer, &tr.to_buffer, buffer);
         if !ret {
             tr.frame = frame + 1;
         } else {
-            self.transitions.remove(tr_idx);
+            let Transition {
+                from_buffer,
+                to_buffer,
+                ..
+            } = self.transitions.remove(tr_idx);
+            drop(from_buffer);
+            drop(to_buffer);
         }
         Some(())
     }
@@ -92,9 +97,7 @@ impl TransitionManager {
     fn has_transitions(&self) -> bool {
         !self.transitions.is_empty()
     }
-
 }
-
 
 pub type SharedMonitorMeta = Arc<RwLock<Vec<MonitorMeta>>>;
 pub struct WallpaperLayer {
@@ -104,7 +107,7 @@ pub struct WallpaperLayer {
     pub event_queue: Option<EventQueue<Self>>,
     pub layer_shell: LayerShell,
     pub compositor_state: CompositorState,
-    pub pool: SlotPool,
+    pub pool: Option<SlotPool>,
     pub shm: Shm,
 
     cons: Receiver<RenderCmd>,
@@ -123,7 +126,7 @@ impl WallpaperLayer {
 
         let shm = Shm::bind(&globals, &qh)?;
 
-        let pool = SlotPool::new(1, &shm)?;
+        let pool = None;
         let layer_shell = LayerShell::bind(&globals, &qh)?;
         let monitors = vec![];
 
@@ -162,7 +165,7 @@ impl WallpaperLayer {
             width: monitor_meta.width,
             height: monitor_meta.height,
             layer,
-            configured: false
+            configured: false,
         };
         self.monitors.push(monitor);
         let mut mons = self.monitor_meta.write().unwrap();
@@ -186,7 +189,9 @@ impl WallpaperLayer {
             return Ok(());
         }
 
-        let mut transition_manager = self.transition_manager.take()
+        let mut transition_manager = self
+            .transition_manager
+            .take()
             .context("Missing transition manager")?;
 
         let (buffer, canvas) = self.create_buffer(&monitor)?;
@@ -203,9 +208,11 @@ impl WallpaperLayer {
             if result == 1 {
                 tracing::info!("Memory was released back to the system.");
             } else {
-                tracing::info!("No memory could be released, or the function is not available on this platform.");
+                tracing::info!(
+                    "No memory could be released, or the function is not available on this platform."
+                );
             }
-
+            self.pool.take();
             self.wait_for_commands(true);
         } else {
             self.wait_for_commands(false);
@@ -228,8 +235,9 @@ impl WallpaperLayer {
             dest_argb_buff_path,
             tr_type,
             tr_origin,
-            angle
-        }) = recv() else {
+            angle,
+        }) = recv()
+        else {
             return;
         };
 
@@ -247,19 +255,27 @@ impl WallpaperLayer {
         };
         let expected_buffer_len = (width * height * 4) as usize;
         if from_buffer.len() != expected_buffer_len {
-            tracing::error!("Failed to create transition, since from buffer len is unexpected size: {}", from_buffer.len());
+            tracing::error!(
+                "Failed to create transition, since from buffer len is unexpected size: {}",
+                from_buffer.len()
+            );
             return;
         }
 
         if to_buffer.len() != expected_buffer_len {
-            tracing::error!("Failed to create transition, since to buffer len is unexpected size: {}", to_buffer.len());
+            tracing::error!(
+                "Failed to create transition, since to buffer len is unexpected size: {}",
+                to_buffer.len()
+            );
             return;
         }
 
         let transition = match tr_type {
-            wpdm_common::TransitionType::Wipe => TransitionAnim::wipe(width, height, angle, tr_origin),
+            wpdm_common::TransitionType::Wipe => {
+                TransitionAnim::wipe(width, height, angle, tr_origin)
+            }
             wpdm_common::TransitionType::Circle => TransitionAnim::circle(width, height, tr_origin),
-            wpdm_common::TransitionType::None => TransitionAnim::none(width, height)
+            wpdm_common::TransitionType::None => TransitionAnim::none(width, height),
         };
 
         let tr = Transition {
@@ -267,7 +283,7 @@ impl WallpaperLayer {
             monitor,
             transition,
             from_buffer,
-            to_buffer
+            to_buffer,
         };
 
         if let Some(trm) = self.transition_manager.as_mut() {
@@ -277,11 +293,9 @@ impl WallpaperLayer {
 
     fn get_monitor_size(&self, monitor: &str) -> Option<(u32, u32)> {
         let read_shared = self.monitor_meta.read().unwrap();
-        let meta = read_shared.iter()
-            .find(|meta| meta.name == monitor)?;
+        let meta = read_shared.iter().find(|meta| meta.name == monitor)?;
         Some((meta.width as u32, meta.height as u32))
     }
-
 
     fn get_monitor(&mut self, surface: &WlSurface, configure: bool) -> Option<Monitor> {
         if configure {
@@ -317,7 +331,14 @@ impl WallpaperLayer {
     }
 
     fn create_buffer(&mut self, monitor: &Monitor) -> anyhow::Result<(Buffer, &mut [u8])> {
-        let (buffer, canvas) = self.pool.create_buffer(
+        let pool = if self.pool.is_some() {
+            self.pool.as_mut()
+        } else {
+            self.pool = Some(SlotPool::new(1, &self.shm)?);
+            self.pool.as_mut()
+        };
+
+        let (buffer, canvas) = pool.unwrap().create_buffer(
             monitor.width,
             monitor.height,
             monitor.width * 4,
@@ -344,14 +365,18 @@ impl WallpaperLayer {
             .logical_size
             .context("Failed to get monitor width and height")?;
 
-        Ok(MonitorMeta { name: monitor_name, width, height })
+        Ok(MonitorMeta {
+            name: monitor_name,
+            width,
+            height,
+        })
     }
 
     fn create_layer_shell(
         &self,
         qh: &QueueHandle<Self>,
         output: &wl_output::WlOutput,
-        monitor_meta: &MonitorMeta
+        monitor_meta: &MonitorMeta,
     ) -> LayerSurface {
         let surface = self.compositor_state.create_surface(qh);
         let layer = self.layer_shell.create_layer_surface(
@@ -368,7 +393,6 @@ impl WallpaperLayer {
         layer
     }
 
-
     pub fn run(&mut self) -> anyhow::Result<()> {
         let Some(mut evt_queue) = self.event_queue.take() else {
             return Ok(());
@@ -381,5 +405,4 @@ impl WallpaperLayer {
             evt_queue.blocking_dispatch(self)?;
         }
     }
-
 }
