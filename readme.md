@@ -1,3 +1,3 @@
 # WPDM
 
-A bad copycat of the awww wayland wallpaper manager.
+A wallpaper manager inspired by AWWW.
