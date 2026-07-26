@@ -1,4 +1,4 @@
-use std::os::fd::{AsFd, AsRawFd};
+use std::{io, os::fd::{AsFd, AsRawFd}};
 
 use mio::{Events, Interest, Poll, Token, unix::SourceFd};
 use wayland_client::{backend::WaylandError, EventQueue};
@@ -52,7 +52,18 @@ impl WpdmIo {
         self.layer_evq.dispatch_pending(&mut self.layer_io)?;
 
         if let Some(guard) = self.layer_evq.prepare_read() {
-            self.poll.poll(&mut self.events, None)?;
+            tracing::info!("Polling...");
+            loop {
+                match self.poll.poll(&mut self.events, None) {
+                    Ok(()) => break,
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {
+                        tracing::info!("System call interrupted by signal (EINTR). Retrying...");
+                        continue;
+                    },
+                    Err(e) => return Err(e.into())
+                }
+            }
+            tracing::info!("Received some events...");
 
             if self.events.iter().any(|e| e.token() == LAYER_TOKEN) {
                 match guard.read() {
