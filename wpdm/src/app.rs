@@ -1,12 +1,16 @@
+use std::time::Instant;
+
 use wayland_client::protocol::wl_shm;
 use wpdm_common::{CliRequest, WallpaperCmd, disk_state::DiskState};
 
 use crate::{io::{event::{WpdmIoEvent, WpdmIoOutputEvent, WpdmIoRenderEvent, WpdmIoRenderRequest, WpdmIoRequest}, wpdm_io::WpdmIo}, transitions::{anim::TransitionAnim, manager::{Transition, TransitionManager}}, util::mmap_buffer};
 
+const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000 / 1001);
 
 pub struct WpdmApp {
     io: WpdmIo,
-    trm: TransitionManager
+    trm: TransitionManager,
+    last_render: Instant,
 }
 
 impl WpdmApp {
@@ -14,7 +18,7 @@ impl WpdmApp {
         let io = WpdmIo::new()?;
         let trm = TransitionManager::new();
 
-        Ok(WpdmApp { io, trm })
+        Ok(WpdmApp { io, trm, last_render: Instant::now() })
     }
 
     pub fn run(&mut self) -> anyhow::Result<()> {
@@ -58,7 +62,11 @@ impl WpdmApp {
             };
         if let Some(()) = self.trm.render_transition(&oi.name, canvas) {
             let has_transitions = self.trm.has_transitions();
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            let elapsed = self.last_render.elapsed();
+            if elapsed < FRAME_INTERVAL {
+                std::thread::sleep(FRAME_INTERVAL - elapsed);
+            }
+            self.last_render = Instant::now();
             return vec![WpdmIoRequest::Render( WpdmIoRenderRequest {
                 slot,
                 buffer,
