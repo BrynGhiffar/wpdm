@@ -1787,6 +1787,7 @@ dependencies = [
  "gcd",
  "libc",
  "memmap2",
+ "mio",
  "rand",
  "rayon",
  "rtrb",
@@ -1822,8 +1823,10 @@ dependencies = [
  "postcard",
  "serde",
  "serde_json",
+ "smithay-client-toolkit",
  "thiserror",
  "tracing",
+ "wayland-client",
 ]
 
 [[package]]

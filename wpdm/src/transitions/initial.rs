@@ -13,14 +13,10 @@ impl NoTransition {
     }
 
     pub fn render(&self, frame: u32, from: &[u8], to: &[u8], result: &mut [u8]) -> bool {
-        if frame == 1 {
-            return true;
-        }
         assert_eq!(from.len(), argb_buffer_size(self.width, self.height) as usize);
         assert_eq!(to.len(), argb_buffer_size(self.width, self.height) as usize);
         assert_eq!(result.len(), argb_buffer_size(self.width, self.height) as usize);
 
-        tracing::info!("Should draw here");
         result
             .par_chunks_mut(4)
             .enumerate()
@@ -29,7 +25,7 @@ impl NoTransition {
                 let end = start + 4;
                 chunk.copy_from_slice(&to[start..end]);
             });
-        false
+        frame == 0
     }
 }
 

@@ -123,6 +123,7 @@ impl LayerShellHandler for WallpaperLayer {
         _configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
+        tracing::info!("Configuring");
         self.render(qh, layer.wl_surface(), true).unwrap();
     }
 }

@@ -31,9 +31,7 @@ impl WipeTransition {
     }
 
     pub fn render(&self, frame: u32, from: &[u8], to: &[u8], result: &mut [u8]) -> bool {
-        if frame > self.n_frames {
-            return true;
-        }
+        let iframe = frame;
         assert_eq!(from.len(), argb_buffer_size(self.width, self.height) as usize);
         assert_eq!(to.len(), argb_buffer_size(self.width, self.height) as usize);
         assert_eq!(result.len(), argb_buffer_size(self.width, self.height) as usize);
@@ -60,7 +58,7 @@ impl WipeTransition {
                     chunk.copy_from_slice(&from[start..end]);
                 }
             });
-        false
+        iframe >= self.n_frames
     }
 }
 

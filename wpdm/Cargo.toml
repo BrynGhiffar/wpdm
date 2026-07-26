@@ -17,3 +17,4 @@ simsimd = { workspace = true }
 libc = "0.2"
 memmap2 = "0.9"
 rand = { workspace = true }
+mio = { workspace = true }

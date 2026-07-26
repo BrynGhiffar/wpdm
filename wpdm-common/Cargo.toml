@@ -11,3 +11,5 @@ tracing = { workspace = true }
 mio = { workspace = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
+smithay-client-toolkit = { workspace = true }
+wayland-client = { workspace = true }

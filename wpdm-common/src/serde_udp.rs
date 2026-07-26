@@ -1,4 +1,4 @@
-use std::{marker::PhantomData, net::UdpSocket};
+use std::{marker::PhantomData, net::UdpSocket, os::fd::AsFd};
 
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -12,6 +12,13 @@ pub struct SerdeUdp<Req, Res, const B: usize = 1024> {
     res_marker: PhantomData<Res>,
     buffer: [u8; B]
 }
+
+impl<Req, Res, const B: usize>  AsFd for SerdeUdp<Req, Res, B> {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.socket.as_fd()
+    }
+}
+
 
 #[derive(thiserror::Error, Debug)]
 pub enum SerdeUdpErr {

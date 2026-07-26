@@ -49,11 +49,11 @@ pub struct Monitor {
 }
 
 pub struct Transition {
-    monitor: String,
-    frame: u32,
-    from_buffer: Mmap,
-    to_buffer: Mmap,
-    transition: TransitionAnim,
+    pub monitor: String,
+    pub frame: u32,
+    pub from_buffer: Mmap,
+    pub to_buffer: Mmap,
+    pub transition: TransitionAnim,
 }
 
 pub struct TransitionManager {
@@ -61,13 +61,13 @@ pub struct TransitionManager {
 }
 
 impl TransitionManager {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             transitions: vec![],
         }
     }
 
-    fn render_transition(&mut self, monitor: &str, buffer: &mut [u8]) -> Option<()> {
+    pub fn render_transition(&mut self, monitor: &str, buffer: &mut [u8]) -> Option<()> {
         let tr_idx = self
             .transitions
             .iter()
@@ -94,7 +94,7 @@ impl TransitionManager {
         Some(())
     }
 
-    fn has_transitions(&self) -> bool {
+    pub fn has_transitions(&self) -> bool {
         !self.transitions.is_empty()
     }
 }
@@ -185,7 +185,11 @@ impl WallpaperLayer {
         let monitor = self
             .get_monitor(surface, configure)
             .context("Monitor not found")?;
+        if configure {
+            tracing::info!("Configuring {:?}", &monitor.name);
+        }
         if !monitor.configured {
+            tracing::info!("Monitor {:?} is not configured", &monitor.name);
             return Ok(());
         }
 
@@ -212,6 +216,7 @@ impl WallpaperLayer {
                     "No memory could be released, or the function is not available on this platform."
                 );
             }
+            // IMPORTANT: This saves about 15 MB of memory after transition is finished
             self.pool.take();
             self.wait_for_commands(true);
         } else {
