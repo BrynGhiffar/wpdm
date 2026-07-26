@@ -4,8 +4,6 @@ mod layer;
 mod loader;
 mod transitions;
 mod util;
-mod handler;
-mod cmd;
 mod io;
 mod app;
 
