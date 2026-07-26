@@ -1,6 +1,7 @@
-pub mod initial;
-pub mod wipe;
-pub mod manager;
 pub mod anim;
+pub mod blit;
 pub mod circle;
+pub mod initial;
+pub mod manager;
+pub mod wipe;
 
