@@ -1,7 +1,5 @@
 use memmap2::Mmap;
 
-#[allow(unused)]
-use crate::loader::load_argb_buffer;
 use crate::transitions::anim::TransitionAnim;
 
 pub struct Transition {

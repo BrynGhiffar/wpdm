@@ -1,7 +1,5 @@
 //! wpdm - A wallpaper daemon for wayland
 
-mod layer;
-mod loader;
 mod transitions;
 mod util;
 mod io;

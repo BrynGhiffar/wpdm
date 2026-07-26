@@ -1,7 +1,7 @@
 use wayland_client::protocol::wl_shm;
 use wpdm_common::{CliRequest, WallpaperCmd, disk_state::DiskState};
 
-use crate::{io::{event::{WpdmIoEvent, WpdmIoOutputEvent, WpdmIoRenderEvent, WpdmIoRenderRequest, WpdmIoRequest}, wpdm_io::WpdmIo}, loader::mmap_buffer, transitions::{anim::TransitionAnim, manager::{Transition, TransitionManager}}};
+use crate::{io::{event::{WpdmIoEvent, WpdmIoOutputEvent, WpdmIoRenderEvent, WpdmIoRenderRequest, WpdmIoRequest}, wpdm_io::WpdmIo}, transitions::{anim::TransitionAnim, manager::{Transition, TransitionManager}}, util::mmap_buffer};
 
 
 pub struct WpdmApp {
