@@ -243,7 +243,7 @@ impl OutputHandler for WpdmLayerIO {
             qh,
             surface,
             Layer::Background,
-            Some("background_layer"),
+            Some("wpdm"),
             Some(&output),
         );
         layer.set_anchor(Anchor::BOTTOM);
