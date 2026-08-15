@@ -1,4 +1,4 @@
-use std::{io, os::fd::{AsFd, AsRawFd}};
+use std::os::fd::{AsFd, AsRawFd};
 
 use mio::{Events, Interest, Poll, Token, unix::SourceFd};
 use wayland_client::{backend::WaylandError, EventQueue};
@@ -56,7 +56,7 @@ impl WpdmIo {
             loop {
                 match self.poll.poll(&mut self.events, None) {
                     Ok(()) => break,
-                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
                         tracing::info!("System call interrupted by signal (EINTR). Retrying...");
                         continue;
                     },
@@ -89,13 +89,11 @@ impl WpdmIo {
     pub fn send(&mut self, req: WpdmIoRequest) -> anyhow::Result<()> {
         match req {
             WpdmIoRequest::InitRender(oi) => self.layer_io.init_render(oi)?,
-            WpdmIoRequest::Render(req) => { 
-                self.layer_io.render(req)?
-            },
-            WpdmIoRequest::CliMonitorQuery => {
-                let monitors = self.layer_io.monitor_query();
-                self.listener.send(CliResponse::Monitors(monitors))?;
-            }
+            WpdmIoRequest::Render(req) =>  self.layer_io.render(req)?,
+            WpdmIoRequest::CliMonitorQuery => self.listener.send(
+                CliResponse::Monitors(self.layer_io.monitor_query())
+            )?
+            
         }
         Ok(())
     }
