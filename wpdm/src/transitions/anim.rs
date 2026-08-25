@@ -5,6 +5,7 @@ use wpdm_common::TransitionOrigin;
 
 use crate::transitions::{circle::{CircleTransition, CircleTransitionOpt}, initial::NoTransition, wipe::{WipeTransition, WipeTransitionOpt}};
 
+#[derive(Debug, Clone)]
 pub enum TransitionAnim {
     Circle(CircleTransition),
     Wipe(WipeTransition),

@@ -18,3 +18,7 @@ simsimd = { workspace = true }
 libc = "0.2"
 memmap2 = "0.9"
 rand = { workspace = true }
+wgpu = { workspace = true }
+pollster = { workspace = true }
+raw-window-handle = { workspace = true }
+bytemuck = { workspace = true }

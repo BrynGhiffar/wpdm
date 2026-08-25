@@ -88,6 +88,7 @@ impl WpdmIo {
 
     pub fn send(&mut self, req: WpdmIoRequest) -> anyhow::Result<()> {
         match req {
+            WpdmIoRequest::StartTransition(req) => self.layer_io.start_transition(req)?,
             WpdmIoRequest::InitRender(oi) => self.layer_io.init_render(oi)?,
             WpdmIoRequest::Render(req) =>  self.layer_io.render(req)?,
             WpdmIoRequest::CliMonitorQuery => self.listener.send(

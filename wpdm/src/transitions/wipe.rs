@@ -5,6 +5,7 @@ use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, IntoParallel
 use crate::transitions::blit::blit;
 use crate::util::argb_buffer_size;
 
+#[derive(Debug, Clone)]
 pub struct WipeTransition {
     n_frames: u32,
     width: u32,

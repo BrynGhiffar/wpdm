@@ -1,16 +1,17 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, ptr::NonNull};
 
 use anyhow::Context;
+use raw_window_handle::{RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState}, delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer, delegate_registry, delegate_seat, delegate_shm, output::{OutputHandler, OutputState}, registry::{ProvidesRegistryState, RegistryState}, registry_handlers, seat::{Capability, SeatHandler, SeatState, keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers}, pointer::{PointerEvent, PointerHandler}}, shell::{WaylandSurface, wlr_layer::{Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure}}, shm::{Shm, ShmHandler, slot::SlotPool}
 };
 
 use wayland_client::{
-    Connection, EventQueue, QueueHandle, globals::registry_queue_init, protocol::{wl_keyboard::WlKeyboard, wl_output::{Transform, WlOutput}, wl_pointer::WlPointer, wl_seat::WlSeat, wl_shm, wl_surface::WlSurface}
+    Connection, EventQueue, Proxy, QueueHandle, globals::registry_queue_init, protocol::{wl_keyboard::WlKeyboard, wl_output::{Transform, WlOutput}, wl_pointer::WlPointer, wl_seat::WlSeat, wl_shm, wl_surface::WlSurface}
 };
 use wpdm_common::{WpdmMonitor, WpdmMonitors};
 
-use crate::io::event::{WpdmIoEvent, WpdmIoOutputEvent, WpdmIoRenderEvent, WpdmIoRenderRequest, WpdmOutputInfo};
+use crate::{io::{event::{StartTransitionReq, WpdmIoEvent, WpdmIoOutputEvent, WpdmIoRenderEvent, WpdmIoRenderRequest, WpdmOutputInfo}, gpu::GpuContext}, util::mmap_buffer};
 
 
 #[derive(Debug)]
@@ -20,6 +21,7 @@ pub struct WpdmOutput {
     pub width: i32,
     pub height: i32,
     pub configured: bool,
+    pub surface: Option<wgpu::Surface<'static>>
 }
 
 impl WpdmOutput {
@@ -38,7 +40,8 @@ pub struct WpdmLayerIO {
     pub shm: Shm,
     pub qh: QueueHandle<Self>,
     pub outputs: Vec<WpdmOutput>,
-    pub io_queue: VecDeque<WpdmIoEvent>
+    pub io_queue: VecDeque<WpdmIoEvent>,
+    pub gpu_context: GpuContext
 }
 
 impl WpdmLayerIO {
@@ -53,6 +56,8 @@ impl WpdmLayerIO {
 
         let layer_shell = LayerShell::bind(&globals, &qh)?;
 
+        let gpu_context = GpuContext::new()?;
+
         Ok((Self {
             conn,
             registry_state: RegistryState::new(&globals),
@@ -63,7 +68,8 @@ impl WpdmLayerIO {
             qh,
             shm,
             outputs: vec![],
-            io_queue: VecDeque::new()
+            io_queue: VecDeque::new(),
+            gpu_context
         }, event_queue))
     }
 
@@ -82,6 +88,18 @@ impl WpdmLayerIO {
 
         output.layer.wl_surface().frame(&self.qh, output.layer.wl_surface().clone());
         output.layer.commit();
+        Ok(())
+    }
+
+    pub fn start_transition(&self, StartTransitionReq { 
+        oi,
+        from,
+        to, 
+        anim
+    }: StartTransitionReq) -> anyhow::Result<()> {
+        let Ok(to_buffer) = mmap_buffer(to.clone()) else {
+            return Ok(());
+        };
         Ok(())
     }
 
@@ -126,12 +144,6 @@ impl WpdmLayerIO {
     fn get_output_by_surface(&self, surface: &WlSurface) -> Option<&WpdmOutput> {
         self.outputs
             .iter()
-            .find(|out| out.layer.wl_surface() == surface)
-    }
-
-    fn get_output_by_surface_mut(&mut self, surface: &WlSurface) -> Option<&mut WpdmOutput> {
-        self.outputs
-            .iter_mut()
             .find(|out| out.layer.wl_surface() == surface)
     }
 
@@ -251,12 +263,30 @@ impl OutputHandler for WpdmLayerIO {
         layer.set_size(output_info.width as u32, output_info.height as u32);
         layer.commit();
 
+        let raw_display_handle = RawDisplayHandle::Wayland(WaylandDisplayHandle::new(
+            NonNull::new(self.conn.backend().display_ptr() as *mut _).unwrap(),
+        ));
+
+        let raw_window_handle = RawWindowHandle::Wayland(WaylandWindowHandle::new(
+            NonNull::new(layer.wl_surface().id().as_ptr() as *mut _).unwrap(),
+        ));
+
+        let surface = unsafe {
+            self.gpu_context.instance
+                .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                    raw_display_handle: Some(raw_display_handle),
+                    raw_window_handle,
+                })
+                .unwrap()
+        };
+
         let output = WpdmOutput {
             name: output_info.name.clone(),
             width: output_info.width,
             height: output_info.height,
             layer,
             configured: false,
+            surface: Some(surface)
         };
 
         let oi = output.to_oi();
@@ -302,7 +332,10 @@ impl LayerShellHandler for WpdmLayerIO {
         _serial: u32,
     ) {
 
-        let output = self.get_output_by_surface_mut(layer.wl_surface());
+        let output = self.outputs
+            .iter_mut()
+            .find(|out| out.layer.wl_surface() == layer.wl_surface());
+
         let Some(output) = output else {
             return;
         };
@@ -311,7 +344,23 @@ impl LayerShellHandler for WpdmLayerIO {
         }
         output.configured = true;
         let oi = output.to_oi();
-        self.io_queue.push_back(WpdmIoEvent::ConfigureOutput(WpdmIoOutputEvent { oi }))
+        if let Some(surf) = output.surface.as_ref() {
+            let surface_config = wgpu::SurfaceConfiguration {
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                format: wgpu::TextureFormat::Bgra8Unorm,
+                view_formats: vec![wgpu::TextureFormat::Bgra8Unorm],
+                alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+                width: oi.width as u32,
+                height: oi.height as u32,
+                desired_maximum_frame_latency: 2,
+                present_mode: wgpu::PresentMode::Mailbox,
+                color_space: wgpu::SurfaceColorSpace::Auto
+            };
+            // gpu_context.instance;
+            surf.configure(&self.gpu_context.device, &surface_config);
+        };
+
+        self.io_queue.push_back(WpdmIoEvent::ConfigureOutput(WpdmIoOutputEvent { oi }));
     }
 }
 

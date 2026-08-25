@@ -2,6 +2,7 @@ use rayon::{iter::{IndexedParallelIterator,ParallelIterator}, slice::ParallelSli
 
 use crate::util::{argb_buffer_size};
 
+#[derive(Debug, Clone)]
 pub struct NoTransition {
     width: u32,
     height: u32,

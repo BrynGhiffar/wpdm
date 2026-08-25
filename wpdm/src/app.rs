@@ -3,7 +3,7 @@ use std::time::Instant;
 use wayland_client::protocol::wl_shm;
 use wpdm_common::{CliRequest, WallpaperCmd, disk_state::DiskState};
 
-use crate::{io::{event::{WpdmIoEvent, WpdmIoOutputEvent, WpdmIoRenderEvent, WpdmIoRenderRequest, WpdmIoRequest}, wpdm_io::WpdmIo}, transitions::{anim::TransitionAnim, manager::{Transition, TransitionManager}}, util::mmap_buffer};
+use crate::{io::{event::{StartTransitionReq, WpdmIoEvent, WpdmIoOutputEvent, WpdmIoRenderEvent, WpdmIoRenderRequest, WpdmIoRequest}, wpdm_io::WpdmIo}, transitions::{anim::TransitionAnim, manager::{Transition, TransitionManager}}, util::mmap_buffer};
 
 const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000 / 1001);
 
@@ -78,12 +78,13 @@ impl WpdmApp {
     }
 
     pub fn configure_logic(&mut self, event: WpdmIoOutputEvent) -> Vec<WpdmIoRequest> {
+        tracing::info!("Running configure logic");
         let WpdmIoOutputEvent { oi } = event;
         let Ok(path) = DiskState::get_curr_wp(&oi.name) else {
             return vec![];
         };
 
-        let transition = TransitionAnim::none(
+        let anim = TransitionAnim::none(
             oi.width as u32,
             oi.height as u32
         );
@@ -99,13 +100,19 @@ impl WpdmApp {
         let transition = Transition {
             frame: 0,
             monitor: oi.name.clone(),
-            transition,
+            transition: anim.clone(),
             from_buffer,
             to_buffer,
         };
         self.trm.transitions.push(transition);
 
-        vec![WpdmIoRequest::InitRender(oi)]
+        let req = StartTransitionReq {
+            oi,
+            from: None,
+            to: path,
+            anim
+        };
+        vec![WpdmIoRequest::StartTransition(req)]
         // vec![]
     }
 
