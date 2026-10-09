@@ -11,17 +11,20 @@ use wayland_client::{
 };
 use wpdm_common::{WpdmMonitor, WpdmMonitors};
 
-use crate::{io::{event::{StartTransitionReq, WpdmIoEvent, WpdmIoOutputEvent, WpdmIoRenderEvent, WpdmIoRenderRequest, WpdmOutputInfo}, gpu::GpuContext}, util::mmap_buffer};
+use crate::{io::{event::{StartTransitionReq, WpdmIoEvent, WpdmIoOutputEvent, WpdmIoRenderEvent, WpdmIoRenderRequest, WpdmOutputInfo}, gpu::{GpuContext, RenderState}}};
 
 
 #[derive(Debug)]
 pub struct WpdmOutput {
     pub name: String,
+    // The wgpu surface points into the wl_surface, so it must be dropped
+    // before layer: fields drop in declaration order.
+    pub surface: Option<wgpu::Surface<'static>>,
     pub layer: LayerSurface,
     pub width: i32,
     pub height: i32,
     pub configured: bool,
-    pub surface: Option<wgpu::Surface<'static>>
+    pub render: Option<RenderState>
 }
 
 impl WpdmOutput {
@@ -91,15 +94,41 @@ impl WpdmLayerIO {
         Ok(())
     }
 
-    pub fn start_transition(&self, StartTransitionReq { 
+    pub fn start_transition(&mut self, StartTransitionReq {
         oi,
         from,
-        to, 
-        anim
+        to,
+        anim: _
     }: StartTransitionReq) -> anyhow::Result<()> {
-        let Ok(to_buffer) = mmap_buffer(to.clone()) else {
+        let gpu = &self.gpu_context;
+        let Some(idx) = self.outputs.iter().position(|out| out.name == oi.name) else {
+            tracing::error!("Cannot start transition: output {} not found", oi.name);
             return Ok(());
         };
+        let output = &self.outputs[idx];
+        if !output.configured {
+            tracing::error!("Cannot start transition on unconfigured output {}", oi.name);
+            return Ok(());
+        }
+        let Some(surf) = output.surface.as_ref() else {
+            tracing::error!("Cannot start transition: no wgpu surface for output {}", oi.name);
+            return Ok(());
+        };
+
+        let state = match gpu.create_render_state(oi.width as u32, oi.height as u32, from.as_deref(), &to) {
+            Ok(state) => state,
+            Err(err) => {
+                tracing::error!("Failed to create render state for output {}: {err}", oi.name);
+                return Ok(());
+            }
+        };
+        if let Err(err) = gpu.present_frame(surf, &state) {
+            tracing::error!("Failed to present frame for output {}: {err}", oi.name);
+            return Ok(());
+        }
+
+        self.outputs[idx].render = Some(state);
+        tracing::info!("Rendered wallpaper on output {}", oi.name);
         Ok(())
     }
 
@@ -286,7 +315,8 @@ impl OutputHandler for WpdmLayerIO {
             height: output_info.height,
             layer,
             configured: false,
-            surface: Some(surface)
+            surface: Some(surface),
+            render: None
         };
 
         let oi = output.to_oi();

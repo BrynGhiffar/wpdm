@@ -1,7 +1,8 @@
-use std::num::NonZero;
+use std::{num::NonZero, path::Path};
 
-use wgpu::{Adapter, Device, Instance, InstanceFlags, MemoryBudgetThresholds, Queue, RenderPipeline};
+use wgpu::{Adapter, BindGroupLayout, Device, Instance, InstanceFlags, MemoryBudgetThresholds, Queue, RenderPipeline, Sampler, Surface, TextureView};
 
+use crate::util::mmap_buffer;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -14,12 +15,24 @@ pub struct TransitionUniform {
     pub has_from: u32
 }
 
+/// Per-monitor GPU state: everything needed to draw one output's wallpaper.
+#[derive(Debug)]
+pub struct RenderState {
+    pub to_view: TextureView,
+    pub from_view: TextureView, // the shared 1x1 dummy view while has_from == 0
+    pub uniform_buf: wgpu::Buffer,
+    pub bind_group: wgpu::BindGroup
+}
+
 pub struct GpuContext {
     pub instance: Instance,
     adapter: Adapter,
     pub device: Device,
     pub queue: Queue,
-    render_pipeline: RenderPipeline
+    pub render_pipeline: RenderPipeline,
+    pub bind_group_layout: BindGroupLayout,
+    pub sampler: Sampler,
+    pub dummy_view: TextureView
 }
 // clippy::new_ret_no_self
 impl GpuContext {
@@ -118,7 +131,45 @@ impl GpuContext {
             multiview_mask: None,
             cache: None
         });
-        Ok(Self { instance, adapter, device, queue, render_pipeline })
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("nearest_clamp_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+
+        let dummy_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("dummy_from"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &dummy_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[0u8, 0, 0, 255],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        let dummy_view = dummy_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        Ok(Self { instance, adapter, device, queue, render_pipeline, bind_group_layout, sampler, dummy_view })
     }
 
     fn new_instance() -> wgpu::Instance {
@@ -133,10 +184,152 @@ impl GpuContext {
 
     fn new_adapter(instance: &Instance) -> anyhow::Result<Adapter> {
         Ok(pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptionsBase {
-            power_preference: wgpu::PowerPreference::HighPerformance, 
+            power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
             compatible_surface: None,
             apply_limit_buckets: false
         }))?)
+    }
+
+    /// Build the per-monitor GPU state for a wallpaper change: upload the
+    /// from/to textures (from may be None on first render), then create the
+    /// uniform buffer and bind group. The mmaps are dropped on return:
+    /// write_texture stages its own copy.
+    pub fn create_render_state(
+        &self,
+        width: u32,
+        height: u32,
+        from: Option<&Path>,
+        to: &Path,
+    ) -> anyhow::Result<RenderState> {
+        let expected_len = (width as usize) * (height as usize) * 4;
+
+        let to_pixels = mmap_buffer(to.to_path_buf())?;
+        anyhow::ensure!(
+            to_pixels.len() == expected_len,
+            "wallpaper buffer {to:?} has length {}, expected {expected_len} ({width}x{height}x4)",
+            to_pixels.len()
+        );
+
+        let (from_view, has_from) = match from {
+            Some(path) => {
+                let pixels = mmap_buffer(path.to_path_buf())?;
+                anyhow::ensure!(
+                    pixels.len() == expected_len,
+                    "wallpaper buffer {path:?} has length {}, expected {expected_len} ({width}x{height}x4)",
+                    pixels.len()
+                );
+                (self.upload_wallpaper(&pixels, width, height, Some("from"))?, 1)
+            }
+            None => (self.dummy_view.clone(), 0),
+        };
+        let to_view = self.upload_wallpaper(&to_pixels, width, height, Some("to"))?;
+
+        let uniform = TransitionUniform {
+            resolution: [width as f32, height as f32],
+            origin: [0.0, 0.0],
+            angle: 0.0,
+            progress: 1.0,
+            effect: 0,
+            has_from,
+        };
+        let uniform_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("transition_uniform"),
+            size: std::mem::size_of::<TransitionUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&uniform_buf, 0, bytemuck::bytes_of(&uniform));
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("transition_bind_group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&to_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&from_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+            ],
+        });
+
+        Ok(RenderState { to_view, from_view, uniform_buf, bind_group })
+    }
+
+    /// Upload one monitor-sized BGRA buffer as a sampleable texture.
+    /// write_texture goes through a staging path, so bytes_per_row does not
+    /// need to be a multiple of 256.
+    fn upload_wallpaper(
+        &self,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        label: Option<&str>,
+    ) -> anyhow::Result<wgpu::TextureView> {
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label,
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+        Ok(texture.create_view(&wgpu::TextureViewDescriptor::default()))
+    }
+
+    /// Draw one frame of the wallpaper in `state` onto `surf` and present it.
+    pub fn present_frame(&self, surf: &Surface, state: &RenderState) -> anyhow::Result<()> {
+        let frame = match surf.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
+            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
+                tracing::warn!("surface is suboptimal, consider reconfiguring");
+                frame
+            }
+            other => anyhow::bail!("get_current_texture failed: {other:?}"),
+        };
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("render_encoder"),
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("render_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.render_pipeline);
+            pass.set_bind_group(0, &state.bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        self.queue.present(frame);
+        Ok(())
     }
 }

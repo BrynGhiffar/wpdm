@@ -3,7 +3,7 @@ use std::time::Instant;
 use wayland_client::protocol::wl_shm;
 use wpdm_common::{CliRequest, WallpaperCmd, disk_state::DiskState};
 
-use crate::{io::{event::{StartTransitionReq, WpdmIoEvent, WpdmIoOutputEvent, WpdmIoRenderEvent, WpdmIoRenderRequest, WpdmIoRequest}, wpdm_io::WpdmIo}, transitions::{anim::TransitionAnim, manager::{Transition, TransitionManager}}, util::mmap_buffer};
+use crate::{io::{event::{StartTransitionReq, WpdmIoEvent, WpdmIoOutputEvent, WpdmIoRenderEvent, WpdmIoRenderRequest, WpdmIoRequest}, wpdm_io::WpdmIo}, transitions::{anim::TransitionAnim, manager::TransitionManager}};
 
 const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000 / 1001);
 
@@ -89,31 +89,12 @@ impl WpdmApp {
             oi.height as u32
         );
 
-        let Ok(from_buffer) = mmap_buffer(path.clone()) else {
-            return vec![];
-        };
-
-        let Ok(to_buffer) = mmap_buffer(path.clone()) else {
-            return vec![];
-        };
-
-        let transition = Transition {
-            frame: 0,
-            monitor: oi.name.clone(),
-            transition: anim.clone(),
-            from_buffer,
-            to_buffer,
-        };
-        self.trm.transitions.push(transition);
-
-        let req = StartTransitionReq {
+        vec![WpdmIoRequest::StartTransition(StartTransitionReq {
             oi,
             from: None,
             to: path,
             anim
-        };
-        vec![WpdmIoRequest::StartTransition(req)]
-        // vec![]
+        })]
     }
 
     pub fn new_output_logic(&mut self, _: WpdmIoOutputEvent) -> Vec<WpdmIoRequest> {
@@ -134,10 +115,10 @@ impl WpdmApp {
     pub fn wp_change_logic(&mut self, cmd: WallpaperCmd) -> Vec<WpdmIoRequest> {
         let mut reqs = vec![];
         for name in cmd.monitors {
-            let src_argb_buff_path = DiskState::get_curr_wp(&name)
+            let from_path = DiskState::get_curr_wp(&name)
                 .unwrap_or_else(|_| cmd.path.clone());
 
-            let dest_argb_buff_path = cmd.path.clone();
+            let to_path = cmd.path.clone();
             if let Err(err) = DiskState::try_save_wp(&name, &cmd.path) {
                 tracing::error!("Failed to save wallpaper: {err}");
             }
@@ -145,31 +126,8 @@ impl WpdmApp {
             let Some(oi) = self.io.get_oi_by_name(&name) else {
                 continue;
             };
-            let Ok(from_buffer) = mmap_buffer(src_argb_buff_path.clone()) else {
-                continue;
-            };
-            let Ok(to_buffer) = mmap_buffer(dest_argb_buff_path.clone()) else {
-                continue;
-            };
 
-            let expected_buffer_len = (oi.width * oi.height * 4) as usize;
-            if from_buffer.len() != expected_buffer_len {
-                tracing::error!(
-                    "Failed to create transition, since from buffer len is unexpected size: {}",
-                    from_buffer.len()
-                );
-                continue;
-            }
-
-            if to_buffer.len() != expected_buffer_len {
-                tracing::error!(
-                    "Failed to create transition, since to buffer len is unexpected size: {}",
-                    to_buffer.len()
-                );
-                continue;
-            }
-
-            let transition = match cmd.tran_type {
+            let anim = match cmd.tran_type {
                 wpdm_common::TransitionType::Wipe => TransitionAnim::wipe(
                     oi.width as u32,
                     oi.height as u32,
@@ -187,16 +145,12 @@ impl WpdmApp {
                 ),
             };
 
-            let tr = Transition {
-                frame: 0,
-                monitor: name,
-                transition,
-                from_buffer,
-                to_buffer,
-            };
-
-            self.trm.transitions.push(tr);
-            reqs.push(WpdmIoRequest::InitRender(oi));
+            reqs.push(WpdmIoRequest::StartTransition(StartTransitionReq {
+                oi,
+                from: Some(from_path),
+                to: to_path,
+                anim
+            }));
         }
         reqs
     }
