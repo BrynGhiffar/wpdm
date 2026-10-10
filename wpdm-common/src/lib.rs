@@ -74,24 +74,3 @@ impl WpdmClient {
         Ok(mon.monitors)
     }
 }
-
-pub struct WpdmListener {
-    listener: SerdeUdp<CliResponse, CliRequest>,
-}
-
-impl WpdmListener {
-    pub fn new() -> anyhow::Result<Self> {
-        let listener = SerdeUdp::server()?;
-        Ok(Self { listener })
-    }
-
-    pub fn monitors(&mut self, monitors: Vec<WpdmMonitor>) -> anyhow::Result<()> {
-        let message = CliResponse::Monitors(WpdmMonitors { monitors });
-        self.listener.send(message)?;
-        Ok(())
-    }
-
-    pub fn poll(&mut self) -> anyhow::Result<CliRequest> {
-        Ok(self.listener.recv()?)
-    }
-}

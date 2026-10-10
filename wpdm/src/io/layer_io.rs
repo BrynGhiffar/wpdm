@@ -3,7 +3,7 @@ use std::{collections::VecDeque, ptr::NonNull};
 use anyhow::Context;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle};
 use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState}, delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer, delegate_registry, delegate_seat, delegate_shm, output::{OutputHandler, OutputState}, registry::{ProvidesRegistryState, RegistryState}, registry_handlers, seat::{Capability, SeatHandler, SeatState, keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers}, pointer::{PointerEvent, PointerHandler}}, shell::{WaylandSurface, wlr_layer::{Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure}}, shm::{Shm, ShmHandler}
+    compositor::{CompositorHandler, CompositorState}, delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer, delegate_registry, delegate_seat, output::{OutputHandler, OutputState}, registry::{ProvidesRegistryState, RegistryState}, registry_handlers, seat::{Capability, SeatHandler, SeatState, keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers}, pointer::{PointerEvent, PointerHandler}}, shell::{WaylandSurface, wlr_layer::{Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure}}
 };
 
 use wayland_client::{
@@ -20,6 +20,7 @@ pub struct WpdmOutput {
     // The wgpu surface points into the wl_surface, so it must be dropped
     // before layer: fields drop in declaration order.
     pub surface: Option<wgpu::Surface<'static>>,
+    pub surface_config: Option<wgpu::SurfaceConfiguration>,
     pub layer: LayerSurface,
     pub width: i32,
     pub height: i32,
@@ -40,7 +41,6 @@ pub struct WpdmLayerIO {
     pub output_state: OutputState,
     pub layer_shell: LayerShell,
     pub compositor_state: CompositorState,
-    pub shm: Shm,
     pub qh: QueueHandle<Self>,
     pub outputs: Vec<WpdmOutput>,
     pub io_queue: VecDeque<WpdmIoEvent>,
@@ -55,8 +55,6 @@ impl WpdmLayerIO {
 
         let compositor_state = CompositorState::bind(&globals, &qh)?;
 
-        let shm = Shm::bind(&globals, &qh)?;
-
         let layer_shell = LayerShell::bind(&globals, &qh)?;
 
         let gpu_context = GpuContext::new()?;
@@ -69,7 +67,6 @@ impl WpdmLayerIO {
             layer_shell,
             compositor_state,
             qh,
-            shm,
             outputs: vec![],
             io_queue: VecDeque::new(),
             gpu_context
@@ -104,17 +101,27 @@ impl WpdmLayerIO {
                 return Ok(());
             }
         };
+        let animated = !matches!(anim.tran_type, TransitionType::None);
         // For animated transitions, request the first frame callback before
         // presenting: the present commits the surface and arms the callback.
-        if !matches!(anim.tran_type, TransitionType::None) {
+        if animated {
             output.layer.wl_surface().frame(&self.qh, output.layer.wl_surface().clone());
         }
-        if let Err(err) = gpu.present_frame(surf, &state) {
+        let Some(config) = output.surface_config.as_ref() else {
+            tracing::error!("Cannot start transition: no surface config for output {}", oi.name);
+            return Ok(());
+        };
+        if let Err(err) = gpu.present_frame(surf, &state, config) {
             tracing::error!("Failed to present frame for output {}: {err}", oi.name);
             return Ok(());
         }
 
-        self.outputs[idx].render = Some(state);
+        // Hard cuts have nothing left to animate: don't keep the render
+        // state (two full-resolution textures) alive in the idle daemon.
+        // The swapchain keeps showing the presented frame.
+        if animated {
+            self.outputs[idx].render = Some(state);
+        }
         tracing::info!("Rendered wallpaper on output {}", oi.name);
         Ok(())
     }
@@ -138,6 +145,9 @@ impl WpdmLayerIO {
         let Some(surf) = output.surface.as_ref() else {
             return Ok(());
         };
+        let Some(config) = output.surface_config.as_ref() else {
+            return Ok(());
+        };
         let Some(state) = output.render.as_ref() else {
             tracing::error!("Cannot render: no render state for output {}", oi.name);
             return Ok(());
@@ -149,8 +159,16 @@ impl WpdmLayerIO {
         if render_next {
             output.layer.wl_surface().frame(&self.qh, output.layer.wl_surface().clone());
         }
-        if let Err(err) = gpu.present_frame(surf, state) {
+        if let Err(err) = gpu.present_frame(surf, state, config) {
             tracing::error!("Failed to present frame for output {}: {err}", oi.name);
+            return Ok(());
+        }
+        if progress >= 1.0 {
+            // Transition complete: the swapchain keeps showing the final
+            // frame, so drop the render state (two full-resolution
+            // textures per monitor) instead of holding it in the idle
+            // daemon. The next wallpaper change re-uploads anyway.
+            self.outputs[idx].render = None;
         }
         Ok(())
     }
@@ -312,6 +330,7 @@ impl OutputHandler for WpdmLayerIO {
             layer,
             configured: false,
             surface: Some(surface),
+            surface_config: None,
             render: None
         };
 
@@ -382,7 +401,9 @@ impl LayerShellHandler for WpdmLayerIO {
                 present_mode: wgpu::PresentMode::Mailbox,
                 color_space: wgpu::SurfaceColorSpace::Auto
             };
-            // gpu_context.instance;
+            // Keep the config around so the render path can recover from an
+            // outdated surface by reconfiguring it.
+            output.surface_config = Some(surface_config.clone());
             surf.configure(&self.gpu_context.device, &surface_config);
         };
 
@@ -495,12 +516,6 @@ impl PointerHandler for WpdmLayerIO {
     }
 }
 
-impl ShmHandler for WpdmLayerIO {
-    fn shm_state(&mut self) -> &mut Shm {
-        &mut self.shm
-    }
-}
-
 impl ProvidesRegistryState for WpdmLayerIO {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
@@ -513,6 +528,5 @@ delegate_output!(WpdmLayerIO);
 delegate_seat!(WpdmLayerIO);
 delegate_keyboard!(WpdmLayerIO);
 delegate_pointer!(WpdmLayerIO);
-delegate_shm!(WpdmLayerIO);
 delegate_layer!(WpdmLayerIO);
 delegate_registry!(WpdmLayerIO);

@@ -1,4 +1,4 @@
-use std::{num::NonZero, path::Path};
+use std::{num::NonZero, path::Path, sync::Arc};
 
 use wgpu::{Adapter, BindGroupLayout, Device, Instance, InstanceFlags, MemoryBudgetThresholds, Queue, RenderPipeline, Sampler, Surface, TextureView};
 use wpdm_common::TransitionType;
@@ -41,10 +41,17 @@ impl GpuContext {
     pub fn new() -> anyhow::Result<Self> {
         let instance = Self::new_instance();
         let adapter = Self::new_adapter(&instance)?;
+        let info = adapter.get_info();
+        tracing::info!("Using GPU adapter: {} ({:?}, driver: {})", info.name, info.device_type, info.driver);
         let (device, queue) = pollster::block_on(
             adapter.request_device(&wgpu::DeviceDescriptor {
                 ..Default::default()
             }))?;
+        // wgpu errors are fatal by default: log them instead, so one bad
+        // frame does not take the daemon down.
+        device.on_uncaptured_error(Arc::new(|err| {
+            tracing::error!("wgpu uncaptured error: {err}");
+        }));
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into())
@@ -329,12 +336,28 @@ impl GpuContext {
     }
 
     /// Draw one frame of the wallpaper in `state` onto `surf` and present it.
-    pub fn present_frame(&self, surf: &Surface, state: &RenderState) -> anyhow::Result<()> {
+    /// `config` is the surface's configuration, used to recover from an
+    /// outdated surface by reconfiguring it and skipping the frame.
+    pub fn present_frame(
+        &self,
+        surf: &Surface,
+        state: &RenderState,
+        config: &wgpu::SurfaceConfiguration,
+    ) -> anyhow::Result<()> {
         let frame = match surf.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
                 tracing::warn!("surface is suboptimal, consider reconfiguring");
                 frame
+            }
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                surf.configure(&self.device, config);
+                tracing::warn!("surface outdated, reconfigured; skipping frame");
+                return Ok(());
+            }
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                tracing::debug!("surface busy or occluded; skipping frame");
+                return Ok(());
             }
             other => anyhow::bail!("get_current_texture failed: {other:?}"),
         };
@@ -365,6 +388,16 @@ impl GpuContext {
         }
         self.queue.submit(Some(encoder.finish()));
         self.queue.present(frame);
+        // Pump wgpu's progress so completion callbacks run and dropped
+        // resources are actually freed instead of accumulating.
+        self.maintain();
         Ok(())
+    }
+
+    /// Pump wgpu's internal progress: run completion callbacks and free
+    /// dropped resources. Non-blocking; called after every present and once
+    /// per event loop iteration.
+    pub fn maintain(&self) {
+        let _ = self.device.poll(wgpu::PollType::Poll);
     }
 }

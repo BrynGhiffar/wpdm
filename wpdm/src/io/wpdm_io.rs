@@ -48,6 +48,10 @@ impl WpdmIo {
     pub fn poll(&mut self) -> anyhow::Result<Vec<WpdmIoEvent>> {
         let mut res = vec![];
 
+        // Pump wgpu progress (callbacks, cleanup of dropped resources) so it
+        // keeps up while the loop is idle-blocked in mio.
+        self.layer_io.gpu_context.maintain();
+
         self.layer_evq.flush()?;
         self.layer_evq.dispatch_pending(&mut self.layer_io)?;
 
