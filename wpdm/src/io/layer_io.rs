@@ -3,13 +3,13 @@ use std::{collections::VecDeque, ptr::NonNull};
 use anyhow::Context;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle};
 use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState}, delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer, delegate_registry, delegate_seat, delegate_shm, output::{OutputHandler, OutputState}, registry::{ProvidesRegistryState, RegistryState}, registry_handlers, seat::{Capability, SeatHandler, SeatState, keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers}, pointer::{PointerEvent, PointerHandler}}, shell::{WaylandSurface, wlr_layer::{Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure}}, shm::{Shm, ShmHandler, slot::SlotPool}
+    compositor::{CompositorHandler, CompositorState}, delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer, delegate_registry, delegate_seat, delegate_shm, output::{OutputHandler, OutputState}, registry::{ProvidesRegistryState, RegistryState}, registry_handlers, seat::{Capability, SeatHandler, SeatState, keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers}, pointer::{PointerEvent, PointerHandler}}, shell::{WaylandSurface, wlr_layer::{Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure}}, shm::{Shm, ShmHandler}
 };
 
 use wayland_client::{
-    Connection, EventQueue, Proxy, QueueHandle, globals::registry_queue_init, protocol::{wl_keyboard::WlKeyboard, wl_output::{Transform, WlOutput}, wl_pointer::WlPointer, wl_seat::WlSeat, wl_shm, wl_surface::WlSurface}
+    Connection, EventQueue, Proxy, QueueHandle, globals::registry_queue_init, protocol::{wl_keyboard::WlKeyboard, wl_output::{Transform, WlOutput}, wl_pointer::WlPointer, wl_seat::WlSeat, wl_surface::WlSurface}
 };
-use wpdm_common::{WpdmMonitor, WpdmMonitors};
+use wpdm_common::{TransitionType, WpdmMonitor, WpdmMonitors};
 
 use crate::{io::{event::{StartTransitionReq, WpdmIoEvent, WpdmIoOutputEvent, WpdmIoRenderEvent, WpdmIoRenderRequest, WpdmOutputInfo}, gpu::{GpuContext, RenderState}}};
 
@@ -76,29 +76,11 @@ impl WpdmLayerIO {
         }, event_queue))
     }
 
-    pub fn init_render(&self, oi: WpdmOutputInfo) -> anyhow::Result<()> {
-        let output = self.get_output_by_name(&oi.name).context("Output not found")?;
-        let mut slot = SlotPool::new(1, &self.shm)?;
-
-        let (buffer, _) = slot
-            .create_buffer(oi.width, oi.height, oi.width * 4, wl_shm::Format::Argb8888)?;
-
-        buffer.attach_to(output.layer.wl_surface())?;
-        output
-            .layer
-            .wl_surface()
-            .damage_buffer(0, 0, oi.width, oi.height);
-
-        output.layer.wl_surface().frame(&self.qh, output.layer.wl_surface().clone());
-        output.layer.commit();
-        Ok(())
-    }
-
     pub fn start_transition(&mut self, StartTransitionReq {
         oi,
         from,
         to,
-        anim: _
+        anim
     }: StartTransitionReq) -> anyhow::Result<()> {
         let gpu = &self.gpu_context;
         let Some(idx) = self.outputs.iter().position(|out| out.name == oi.name) else {
@@ -115,13 +97,18 @@ impl WpdmLayerIO {
             return Ok(());
         };
 
-        let state = match gpu.create_render_state(oi.width as u32, oi.height as u32, from.as_deref(), &to) {
+        let state = match gpu.create_render_state(oi.width as u32, oi.height as u32, from.as_deref(), &to, &anim) {
             Ok(state) => state,
             Err(err) => {
                 tracing::error!("Failed to create render state for output {}: {err}", oi.name);
                 return Ok(());
             }
         };
+        // For animated transitions, request the first frame callback before
+        // presenting: the present commits the surface and arms the callback.
+        if !matches!(anim.tran_type, TransitionType::None) {
+            output.layer.wl_surface().frame(&self.qh, output.layer.wl_surface().clone());
+        }
         if let Err(err) = gpu.present_frame(surf, &state) {
             tracing::error!("Failed to present frame for output {}: {err}", oi.name);
             return Ok(());
@@ -133,22 +120,38 @@ impl WpdmLayerIO {
     }
 
     pub fn render(&mut self, WpdmIoRenderRequest {
-        slot: _slot,
-        buffer,
         oi,
+        params,
+        progress,
         render_next
     }: WpdmIoRenderRequest) -> anyhow::Result<()> {
-        let output = self.get_output_by_name(&oi.name).context("Output not found")?;
+        let gpu = &self.gpu_context;
+        let Some(idx) = self.outputs.iter().position(|out| out.name == oi.name) else {
+            tracing::error!("Cannot render: output {} not found", oi.name);
+            return Ok(());
+        };
+        let output = &self.outputs[idx];
         if !output.configured {
             tracing::error!("output needs to be configured before rendered");
-            return Ok(())
+            return Ok(());
         }
-        buffer.attach_to(output.layer.wl_surface())?;
-        output.layer.wl_surface().damage_buffer(0, 0, output.width, output.height);
+        let Some(surf) = output.surface.as_ref() else {
+            return Ok(());
+        };
+        let Some(state) = output.render.as_ref() else {
+            tracing::error!("Cannot render: no render state for output {}", oi.name);
+            return Ok(());
+        };
+
+        gpu.update_uniform(state, &params, progress, oi.width as u32, oi.height as u32);
+        // Request the next callback before presenting: the present commits
+        // the surface and arms the callback.
         if render_next {
             output.layer.wl_surface().frame(&self.qh, output.layer.wl_surface().clone());
         }
-        output.layer.commit();
+        if let Err(err) = gpu.present_frame(surf, state) {
+            tracing::error!("Failed to present frame for output {}: {err}", oi.name);
+        }
         Ok(())
     }
 
@@ -210,16 +213,9 @@ impl CompositorHandler for WpdmLayerIO {
             tracing::error!("LOST_FRAME: Cannot render frame on uninitialized output");
             return;
         };
-        let slot = match SlotPool::new(1, &self.shm) {
-            Ok(pool) => pool,
-            Err(err) => {
-                tracing::error!("LOST_FRAME: Cannot create slot pool: {err}");
-                return;
-            },
-        };
 
         self.io_queue
-            .push_back(WpdmIoEvent::Render(WpdmIoRenderEvent { oi: output.to_oi(), slot }));
+            .push_back(WpdmIoEvent::Render(WpdmIoRenderEvent { oi: output.to_oi() }));
     }
 
     fn scale_factor_changed(

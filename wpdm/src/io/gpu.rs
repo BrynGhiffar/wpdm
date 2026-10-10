@@ -1,8 +1,9 @@
 use std::{num::NonZero, path::Path};
 
 use wgpu::{Adapter, BindGroupLayout, Device, Instance, InstanceFlags, MemoryBudgetThresholds, Queue, RenderPipeline, Sampler, Surface, TextureView};
+use wpdm_common::TransitionType;
 
-use crate::util::mmap_buffer;
+use crate::{io::event::TransitionParams, util::mmap_buffer};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -16,12 +17,13 @@ pub struct TransitionUniform {
 }
 
 /// Per-monitor GPU state: everything needed to draw one output's wallpaper.
+/// The texture views are held alive by the bind group, so they are not
+/// stored here.
 #[derive(Debug)]
 pub struct RenderState {
-    pub to_view: TextureView,
-    pub from_view: TextureView, // the shared 1x1 dummy view while has_from == 0
     pub uniform_buf: wgpu::Buffer,
-    pub bind_group: wgpu::BindGroup
+    pub bind_group: wgpu::BindGroup,
+    pub has_from: u32
 }
 
 pub struct GpuContext {
@@ -201,6 +203,7 @@ impl GpuContext {
         height: u32,
         from: Option<&Path>,
         to: &Path,
+        params: &TransitionParams,
     ) -> anyhow::Result<RenderState> {
         let expected_len = (width as usize) * (height as usize) * 4;
 
@@ -227,10 +230,10 @@ impl GpuContext {
 
         let uniform = TransitionUniform {
             resolution: [width as f32, height as f32],
-            origin: [0.0, 0.0],
-            angle: 0.0,
-            progress: 1.0,
-            effect: 0,
+            origin: params.origin,
+            angle: params.angle,
+            progress: 0.0,
+            effect: Self::effect_id(params.tran_type),
             has_from,
         };
         let uniform_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -252,7 +255,39 @@ impl GpuContext {
             ],
         });
 
-        Ok(RenderState { to_view, from_view, uniform_buf, bind_group })
+        Ok(RenderState { uniform_buf, bind_group, has_from })
+    }
+
+    /// Map the transition type to the shader's effect id.
+    fn effect_id(tran_type: TransitionType) -> u32 {
+        match tran_type {
+            TransitionType::None => 0,
+            TransitionType::Circle => 1,
+            TransitionType::Wipe => 2,
+        }
+    }
+
+    /// Rewrite the per-monitor uniform for the next frame of a transition.
+    /// Cheap: 32 bytes through the staging path, ordered before the next
+    /// submit, so the following render pass sees the new values.
+    pub fn update_uniform(
+        &self,
+        state: &RenderState,
+        params: &TransitionParams,
+        progress: f32,
+        width: u32,
+        height: u32,
+    ) {
+        let uniform = TransitionUniform {
+            resolution: [width as f32, height as f32],
+            origin: params.origin,
+            angle: params.angle,
+            progress,
+            effect: Self::effect_id(params.tran_type),
+            has_from: state.has_from,
+        };
+        self.queue
+            .write_buffer(&state.uniform_buf, 0, bytemuck::bytes_of(&uniform));
     }
 
     /// Upload one monitor-sized BGRA buffer as a sampleable texture.
