@@ -11,7 +11,7 @@ tracing-subscriber = { workspace = true }
 wpdm-common = { workspace = true }
 anyhow = { workspace = true }
 mio = { workspace = true }
-memmap2 = "0.9"
+image = { workspace = true }
 rand = { workspace = true }
 wgpu = { workspace = true }
 pollster = { workspace = true }

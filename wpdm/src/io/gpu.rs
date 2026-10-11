@@ -3,7 +3,7 @@ use std::{num::NonZero, path::Path, sync::Arc};
 use wgpu::{Adapter, BindGroupLayout, Device, Instance, InstanceFlags, MemoryBudgetThresholds, Queue, RenderPipeline, Sampler, Surface, TextureView};
 use wpdm_common::TransitionType;
 
-use crate::{io::event::TransitionParams, util::mmap_buffer};
+use crate::{decode::decode_bgra, io::event::TransitionParams};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -141,12 +141,12 @@ impl GpuContext {
             cache: None
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("nearest_clamp_sampler"),
+            label: Some("linear_clamp_sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
@@ -200,10 +200,11 @@ impl GpuContext {
         }))?)
     }
 
-    /// Build the per-monitor GPU state for a wallpaper change: upload the
-    /// from/to textures (from may be None on first render), then create the
-    /// uniform buffer and bind group. The mmaps are dropped on return:
-    /// write_texture stages its own copy.
+    /// Build the per-monitor GPU state for a wallpaper change: decode the
+    /// from/to source images and upload them as textures (from may be None
+    /// on first render), then create the uniform buffer and bind group.
+    /// The decoded buffers are dropped on return: write_texture stages its
+    /// own copy.
     pub fn create_render_state(
         &self,
         width: u32,
@@ -212,28 +213,16 @@ impl GpuContext {
         to: &Path,
         params: &TransitionParams,
     ) -> anyhow::Result<RenderState> {
-        let expected_len = (width as usize) * (height as usize) * 4;
-
-        let to_pixels = mmap_buffer(to.to_path_buf())?;
-        anyhow::ensure!(
-            to_pixels.len() == expected_len,
-            "wallpaper buffer {to:?} has length {}, expected {expected_len} ({width}x{height}x4)",
-            to_pixels.len()
-        );
+        let (to_pixels, to_w, to_h) = decode_bgra(to)?;
+        let to_view = self.upload_wallpaper(&to_pixels, to_w, to_h, Some("to"))?;
 
         let (from_view, has_from) = match from {
             Some(path) => {
-                let pixels = mmap_buffer(path.to_path_buf())?;
-                anyhow::ensure!(
-                    pixels.len() == expected_len,
-                    "wallpaper buffer {path:?} has length {}, expected {expected_len} ({width}x{height}x4)",
-                    pixels.len()
-                );
-                (self.upload_wallpaper(&pixels, width, height, Some("from"))?, 1)
+                let (pixels, w, h) = decode_bgra(path)?;
+                (self.upload_wallpaper(&pixels, w, h, Some("from"))?, 1)
             }
             None => (self.dummy_view.clone(), 0),
         };
-        let to_view = self.upload_wallpaper(&to_pixels, width, height, Some("to"))?;
 
         let uniform = TransitionUniform {
             resolution: [width as f32, height as f32],
@@ -297,9 +286,9 @@ impl GpuContext {
             .write_buffer(&state.uniform_buf, 0, bytemuck::bytes_of(&uniform));
     }
 
-    /// Upload one monitor-sized BGRA buffer as a sampleable texture.
-    /// write_texture goes through a staging path, so bytes_per_row does not
-    /// need to be a multiple of 256.
+    /// Upload one image-sized BGRA buffer as a sampleable texture, at the
+    /// image's native resolution. write_texture goes through a staging
+    /// path, so bytes_per_row does not need to be a multiple of 256.
     fn upload_wallpaper(
         &self,
         pixels: &[u8],

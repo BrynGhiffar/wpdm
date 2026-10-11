@@ -1,4 +1,4 @@
-use std::{path::Path, time::Instant};
+use std::time::Instant;
 
 use wpdm_common::{CliRequest, TransitionOrigin, TransitionType, WallpaperCmd, disk_state::DiskState};
 
@@ -7,8 +7,7 @@ use crate::{
         event::{StartTransitionReq, TransitionParams, WpdmIoEvent, WpdmIoOutputEvent, WpdmIoRenderEvent, WpdmIoRenderRequest, WpdmIoRequest},
         wpdm_io::WpdmIo
     },
-    transitions::manager::{Transition, TransitionManager},
-    util::mmap_buffer
+    transitions::manager::{Transition, TransitionManager}
 };
 
 const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000 / 1001);
@@ -113,10 +112,11 @@ impl WpdmApp {
     pub fn wp_change_logic(&mut self, cmd: WallpaperCmd) -> Vec<WpdmIoRequest> {
         let mut reqs = vec![];
         for name in cmd.monitors {
-            let from_path = DiskState::get_curr_wp(&name)
-                .unwrap_or_else(|_| cmd.path.clone());
-
-            let to_path = cmd.path.clone();
+            // Read the current wallpaper before overwriting the saved state:
+            // it becomes the transition source (`from`), unless it is the
+            // same image, in which case a hard cut is equivalent.
+            let old_path = DiskState::get_curr_wp(&name).ok();
+            let new_path = cmd.path.clone();
             if let Err(err) = DiskState::try_save_wp(&name, &cmd.path) {
                 tracing::error!("Failed to save wallpaper: {err}");
             }
@@ -124,15 +124,6 @@ impl WpdmApp {
             let Some(oi) = self.io.get_oi_by_name(&name) else {
                 continue;
             };
-
-            // Validate the cache buffers before queueing the transition, so a
-            // missing or wrongly-sized file cannot leave a stuck entry in
-            // the manager (it would freeze the global min-frame for all
-            // monitors).
-            let expected_len = (oi.width * oi.height * 4) as usize;
-            if !valid_cache(&from_path, expected_len) || !valid_cache(&to_path, expected_len) {
-                continue;
-            }
 
             let anim = TransitionParams::new(
                 cmd.tran_type,
@@ -151,31 +142,11 @@ impl WpdmApp {
 
             reqs.push(WpdmIoRequest::StartTransition(StartTransitionReq {
                 oi,
-                from: Some(from_path),
-                to: to_path,
+                from: old_path.filter(|old| old != &new_path),
+                to: new_path,
                 anim
             }));
         }
         reqs
-    }
-}
-
-/// Check that the cached raw BGRA buffer for a wallpaper exists and has the
-/// expected size for its monitor. Validation only: the mmap is dropped here,
-/// the renderer re-maps the file when uploading.
-fn valid_cache(path: &Path, expected_len: usize) -> bool {
-    match mmap_buffer(path.to_path_buf()) {
-        Ok(buf) if buf.len() == expected_len => true,
-        Ok(buf) => {
-            tracing::error!(
-                "Failed to create transition, since buffer {path:?} has unexpected size: {}",
-                buf.len()
-            );
-            false
-        }
-        Err(err) => {
-            tracing::error!("Failed to mmap buffer {path:?}: {err}");
-            false
-        }
     }
 }

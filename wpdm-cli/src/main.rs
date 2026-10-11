@@ -4,11 +4,6 @@ use std::fmt::Display;
 use clap::Parser;
 use wpdm_common::{CliRequest, TransitionOrigin, TransitionType, WallpaperCmd};
 
-use crate::cache::CachedImg;
-use crate::util::group_by_size;
-mod cache;
-mod util;
-
 #[derive(clap::ValueEnum, Debug, Clone, Copy)]
 #[clap(rename_all = "kebab-case")]
 enum ArgTransitionType {
@@ -64,8 +59,6 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let mut client = wpdm_common::WpdmClient::new()?;
 
-    let mut cached_img = CachedImg::new(&args.image_path)?;
-
     let tran_type = match args.transition {
         ArgTransitionType::Circle => TransitionType::Circle,
         ArgTransitionType::None => TransitionType::None,
@@ -78,24 +71,19 @@ fn main() -> anyhow::Result<()> {
         ArgTransitionOrigin::Rand => TransitionOrigin::Random,
     };
 
-    // Get all active monitors
+    // Image decoding and monitor handling happen in the daemon; the cli
+    // only forwards the command. The monitor query doubles as a liveness
+    // check: a dead daemon fails the cli here instead of silently no-op'ing.
     let monitors = client.get_monitors()?;
+    let names = monitors.into_iter().map(|mon| mon.name).collect();
 
-    // Group monitors by size
-    for (width, height, monitors) in group_by_size(monitors) {
-        let img_path = cached_img.get_image(width, height)?;
-
-        let req = CliRequest::WallpaperCmd(WallpaperCmd {
-            path: img_path,
-            monitors,
-            tran_origin,
-            tran_type,
-            angle: args.angle
-        });
-
-        client.send(req)?;
-    }
+    client.send(CliRequest::WallpaperCmd(WallpaperCmd {
+        path: args.image_path.into(),
+        monitors: names,
+        tran_origin,
+        tran_type,
+        angle: args.angle
+    }))?;
 
     Ok(())
 }
-
