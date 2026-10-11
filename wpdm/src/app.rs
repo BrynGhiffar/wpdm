@@ -1,9 +1,15 @@
-use std::time::Instant;
+use std::{path::Path, time::Instant};
 
-use wayland_client::protocol::wl_shm;
-use wpdm_common::{CliRequest, WallpaperCmd, disk_state::DiskState};
+use wpdm_common::{CliRequest, TransitionOrigin, TransitionType, WallpaperCmd, disk_state::DiskState};
 
-use crate::{io::{event::{WpdmIoEvent, WpdmIoOutputEvent, WpdmIoRenderEvent, WpdmIoRenderRequest, WpdmIoRequest}, wpdm_io::WpdmIo}, transitions::{anim::TransitionAnim, manager::{Transition, TransitionManager}}, util::mmap_buffer};
+use crate::{
+    io::{
+        event::{StartTransitionReq, TransitionParams, WpdmIoEvent, WpdmIoOutputEvent, WpdmIoRenderEvent, WpdmIoRenderRequest, WpdmIoRequest},
+        wpdm_io::WpdmIo
+    },
+    transitions::manager::{Transition, TransitionManager},
+    util::mmap_buffer
+};
 
 const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000 / 1001);
 
@@ -46,67 +52,47 @@ impl WpdmApp {
     }
 
     pub fn render_logic(&mut self, event: WpdmIoRenderEvent) -> Vec<WpdmIoRequest> {
-        let WpdmIoRenderEvent { mut slot, oi } = event;
-        let (buffer, canvas) = match slot
-            .create_buffer(
-                oi.width,
-                oi.height,
-                oi.width * 4,
-                wl_shm::Format::Argb8888
-            ) {
-                Ok(res) => res,
-                Err(err) => {
-                    tracing::error!("Failed to create buffer in rendering logic: {err}");
-                    return vec![];
-                }
-            };
-        if let Some(()) = self.trm.render_transition(&oi.name, canvas) {
-            let has_transitions = self.trm.has_transitions();
-            let elapsed = self.last_render.elapsed();
-            if elapsed < FRAME_INTERVAL {
-                std::thread::sleep(FRAME_INTERVAL - elapsed);
-            }
-            self.last_render = Instant::now();
-            return vec![WpdmIoRequest::Render( WpdmIoRenderRequest {
-                slot,
-                buffer,
-                oi,
-                render_next: has_transitions
-            })];
+        let WpdmIoRenderEvent { oi } = event;
+        let Some((params, progress)) = self.trm.advance(&oi.name) else {
+            return vec![];
+        };
+
+        let has_transitions = self.trm.has_transitions();
+        let elapsed = self.last_render.elapsed();
+        if elapsed < FRAME_INTERVAL {
+            std::thread::sleep(FRAME_INTERVAL - elapsed);
         }
-        vec![]
+        self.last_render = Instant::now();
+
+        vec![WpdmIoRequest::Render(WpdmIoRenderRequest {
+            oi,
+            params,
+            progress,
+            render_next: has_transitions
+        })]
     }
 
     pub fn configure_logic(&mut self, event: WpdmIoOutputEvent) -> Vec<WpdmIoRequest> {
+        tracing::info!("Running configure logic");
         let WpdmIoOutputEvent { oi } = event;
         let Ok(path) = DiskState::get_curr_wp(&oi.name) else {
             return vec![];
         };
 
-        let transition = TransitionAnim::none(
+        let anim = TransitionParams::new(
+            TransitionType::None,
+            TransitionOrigin::Center,
+            0.0,
             oi.width as u32,
             oi.height as u32
         );
 
-        let Ok(from_buffer) = mmap_buffer(path.clone()) else {
-            return vec![];
-        };
-
-        let Ok(to_buffer) = mmap_buffer(path.clone()) else {
-            return vec![];
-        };
-
-        let transition = Transition {
-            frame: 0,
-            monitor: oi.name.clone(),
-            transition,
-            from_buffer,
-            to_buffer,
-        };
-        self.trm.transitions.push(transition);
-
-        vec![WpdmIoRequest::InitRender(oi)]
-        // vec![]
+        vec![WpdmIoRequest::StartTransition(StartTransitionReq {
+            oi,
+            from: None,
+            to: path,
+            anim
+        })]
     }
 
     pub fn new_output_logic(&mut self, _: WpdmIoOutputEvent) -> Vec<WpdmIoRequest> {
@@ -127,10 +113,10 @@ impl WpdmApp {
     pub fn wp_change_logic(&mut self, cmd: WallpaperCmd) -> Vec<WpdmIoRequest> {
         let mut reqs = vec![];
         for name in cmd.monitors {
-            let src_argb_buff_path = DiskState::get_curr_wp(&name)
+            let from_path = DiskState::get_curr_wp(&name)
                 .unwrap_or_else(|_| cmd.path.clone());
 
-            let dest_argb_buff_path = cmd.path.clone();
+            let to_path = cmd.path.clone();
             if let Err(err) = DiskState::try_save_wp(&name, &cmd.path) {
                 tracing::error!("Failed to save wallpaper: {err}");
             }
@@ -138,59 +124,58 @@ impl WpdmApp {
             let Some(oi) = self.io.get_oi_by_name(&name) else {
                 continue;
             };
-            let Ok(from_buffer) = mmap_buffer(src_argb_buff_path.clone()) else {
-                continue;
-            };
-            let Ok(to_buffer) = mmap_buffer(dest_argb_buff_path.clone()) else {
-                continue;
-            };
 
-            let expected_buffer_len = (oi.width * oi.height * 4) as usize;
-            if from_buffer.len() != expected_buffer_len {
-                tracing::error!(
-                    "Failed to create transition, since from buffer len is unexpected size: {}",
-                    from_buffer.len()
-                );
+            // Validate the cache buffers before queueing the transition, so a
+            // missing or wrongly-sized file cannot leave a stuck entry in
+            // the manager (it would freeze the global min-frame for all
+            // monitors).
+            let expected_len = (oi.width * oi.height * 4) as usize;
+            if !valid_cache(&from_path, expected_len) || !valid_cache(&to_path, expected_len) {
                 continue;
             }
 
-            if to_buffer.len() != expected_buffer_len {
-                tracing::error!(
-                    "Failed to create transition, since to buffer len is unexpected size: {}",
-                    to_buffer.len()
-                );
-                continue;
+            let anim = TransitionParams::new(
+                cmd.tran_type,
+                cmd.tran_origin,
+                cmd.angle,
+                oi.width as u32,
+                oi.height as u32
+            );
+            if !matches!(anim.tran_type, TransitionType::None) {
+                self.trm.transitions.push(Transition {
+                    frame: 0,
+                    monitor: name.clone(),
+                    params: anim
+                });
             }
 
-            let transition = match cmd.tran_type {
-                wpdm_common::TransitionType::Wipe => TransitionAnim::wipe(
-                    oi.width as u32,
-                    oi.height as u32,
-                    cmd.angle,
-                    cmd.tran_origin
-                ),
-                wpdm_common::TransitionType::Circle => TransitionAnim::circle(
-                    oi.width as u32,
-                    oi.height as u32,
-                    cmd.tran_origin
-                ),
-                wpdm_common::TransitionType::None => TransitionAnim::none(
-                    oi.width as u32,
-                    oi.height as u32
-                ),
-            };
-
-            let tr = Transition {
-                frame: 0,
-                monitor: name,
-                transition,
-                from_buffer,
-                to_buffer,
-            };
-
-            self.trm.transitions.push(tr);
-            reqs.push(WpdmIoRequest::InitRender(oi));
+            reqs.push(WpdmIoRequest::StartTransition(StartTransitionReq {
+                oi,
+                from: Some(from_path),
+                to: to_path,
+                anim
+            }));
         }
         reqs
+    }
+}
+
+/// Check that the cached raw BGRA buffer for a wallpaper exists and has the
+/// expected size for its monitor. Validation only: the mmap is dropped here,
+/// the renderer re-maps the file when uploading.
+fn valid_cache(path: &Path, expected_len: usize) -> bool {
+    match mmap_buffer(path.to_path_buf()) {
+        Ok(buf) if buf.len() == expected_len => true,
+        Ok(buf) => {
+            tracing::error!(
+                "Failed to create transition, since buffer {path:?} has unexpected size: {}",
+                buf.len()
+            );
+            false
+        }
+        Err(err) => {
+            tracing::error!("Failed to mmap buffer {path:?}: {err}");
+            false
+        }
     }
 }

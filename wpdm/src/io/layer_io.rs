@@ -1,25 +1,31 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, ptr::NonNull};
 
 use anyhow::Context;
+use raw_window_handle::{RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle};
 use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState}, delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer, delegate_registry, delegate_seat, delegate_shm, output::{OutputHandler, OutputState}, registry::{ProvidesRegistryState, RegistryState}, registry_handlers, seat::{Capability, SeatHandler, SeatState, keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers}, pointer::{PointerEvent, PointerHandler}}, shell::{WaylandSurface, wlr_layer::{Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure}}, shm::{Shm, ShmHandler, slot::SlotPool}
+    compositor::{CompositorHandler, CompositorState}, delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer, delegate_registry, delegate_seat, output::{OutputHandler, OutputState}, registry::{ProvidesRegistryState, RegistryState}, registry_handlers, seat::{Capability, SeatHandler, SeatState, keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers}, pointer::{PointerEvent, PointerHandler}}, shell::{WaylandSurface, wlr_layer::{Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure}}
 };
 
 use wayland_client::{
-    Connection, EventQueue, QueueHandle, globals::registry_queue_init, protocol::{wl_keyboard::WlKeyboard, wl_output::{Transform, WlOutput}, wl_pointer::WlPointer, wl_seat::WlSeat, wl_shm, wl_surface::WlSurface}
+    Connection, EventQueue, Proxy, QueueHandle, globals::registry_queue_init, protocol::{wl_keyboard::WlKeyboard, wl_output::{Transform, WlOutput}, wl_pointer::WlPointer, wl_seat::WlSeat, wl_surface::WlSurface}
 };
-use wpdm_common::{WpdmMonitor, WpdmMonitors};
+use wpdm_common::{TransitionType, WpdmMonitor, WpdmMonitors};
 
-use crate::io::event::{WpdmIoEvent, WpdmIoOutputEvent, WpdmIoRenderEvent, WpdmIoRenderRequest, WpdmOutputInfo};
+use crate::{io::{event::{StartTransitionReq, WpdmIoEvent, WpdmIoOutputEvent, WpdmIoRenderEvent, WpdmIoRenderRequest, WpdmOutputInfo}, gpu::{GpuContext, RenderState}}};
 
 
 #[derive(Debug)]
 pub struct WpdmOutput {
     pub name: String,
+    // The wgpu surface points into the wl_surface, so it must be dropped
+    // before layer: fields drop in declaration order.
+    pub surface: Option<wgpu::Surface<'static>>,
+    pub surface_config: Option<wgpu::SurfaceConfiguration>,
     pub layer: LayerSurface,
     pub width: i32,
     pub height: i32,
     pub configured: bool,
+    pub render: Option<RenderState>
 }
 
 impl WpdmOutput {
@@ -35,10 +41,10 @@ pub struct WpdmLayerIO {
     pub output_state: OutputState,
     pub layer_shell: LayerShell,
     pub compositor_state: CompositorState,
-    pub shm: Shm,
     pub qh: QueueHandle<Self>,
     pub outputs: Vec<WpdmOutput>,
-    pub io_queue: VecDeque<WpdmIoEvent>
+    pub io_queue: VecDeque<WpdmIoEvent>,
+    pub gpu_context: GpuContext
 }
 
 impl WpdmLayerIO {
@@ -49,9 +55,9 @@ impl WpdmLayerIO {
 
         let compositor_state = CompositorState::bind(&globals, &qh)?;
 
-        let shm = Shm::bind(&globals, &qh)?;
-
         let layer_shell = LayerShell::bind(&globals, &qh)?;
+
+        let gpu_context = GpuContext::new()?;
 
         Ok((Self {
             conn,
@@ -61,47 +67,109 @@ impl WpdmLayerIO {
             layer_shell,
             compositor_state,
             qh,
-            shm,
             outputs: vec![],
-            io_queue: VecDeque::new()
+            io_queue: VecDeque::new(),
+            gpu_context
         }, event_queue))
     }
 
-    pub fn init_render(&self, oi: WpdmOutputInfo) -> anyhow::Result<()> {
-        let output = self.get_output_by_name(&oi.name).context("Output not found")?;
-        let mut slot = SlotPool::new(1, &self.shm)?;
+    pub fn start_transition(&mut self, StartTransitionReq {
+        oi,
+        from,
+        to,
+        anim
+    }: StartTransitionReq) -> anyhow::Result<()> {
+        let gpu = &self.gpu_context;
+        let Some(idx) = self.outputs.iter().position(|out| out.name == oi.name) else {
+            tracing::error!("Cannot start transition: output {} not found", oi.name);
+            return Ok(());
+        };
+        let output = &self.outputs[idx];
+        if !output.configured {
+            tracing::error!("Cannot start transition on unconfigured output {}", oi.name);
+            return Ok(());
+        }
+        let Some(surf) = output.surface.as_ref() else {
+            tracing::error!("Cannot start transition: no wgpu surface for output {}", oi.name);
+            return Ok(());
+        };
 
-        let (buffer, _) = slot
-            .create_buffer(oi.width, oi.height, oi.width * 4, wl_shm::Format::Argb8888)?;
+        let state = match gpu.create_render_state(oi.width as u32, oi.height as u32, from.as_deref(), &to, &anim) {
+            Ok(state) => state,
+            Err(err) => {
+                tracing::error!("Failed to create render state for output {}: {err}", oi.name);
+                return Ok(());
+            }
+        };
+        let animated = !matches!(anim.tran_type, TransitionType::None);
+        // For animated transitions, request the first frame callback before
+        // presenting: the present commits the surface and arms the callback.
+        if animated {
+            output.layer.wl_surface().frame(&self.qh, output.layer.wl_surface().clone());
+        }
+        let Some(config) = output.surface_config.as_ref() else {
+            tracing::error!("Cannot start transition: no surface config for output {}", oi.name);
+            return Ok(());
+        };
+        if let Err(err) = gpu.present_frame(surf, &state, config) {
+            tracing::error!("Failed to present frame for output {}: {err}", oi.name);
+            return Ok(());
+        }
 
-        buffer.attach_to(output.layer.wl_surface())?;
-        output
-            .layer
-            .wl_surface()
-            .damage_buffer(0, 0, oi.width, oi.height);
-
-        output.layer.wl_surface().frame(&self.qh, output.layer.wl_surface().clone());
-        output.layer.commit();
+        // Hard cuts have nothing left to animate: don't keep the render
+        // state (two full-resolution textures) alive in the idle daemon.
+        // The swapchain keeps showing the presented frame.
+        if animated {
+            self.outputs[idx].render = Some(state);
+        }
+        tracing::info!("Rendered wallpaper on output {}", oi.name);
         Ok(())
     }
 
     pub fn render(&mut self, WpdmIoRenderRequest {
-        slot: _slot,
-        buffer,
         oi,
+        params,
+        progress,
         render_next
     }: WpdmIoRenderRequest) -> anyhow::Result<()> {
-        let output = self.get_output_by_name(&oi.name).context("Output not found")?;
+        let gpu = &self.gpu_context;
+        let Some(idx) = self.outputs.iter().position(|out| out.name == oi.name) else {
+            tracing::error!("Cannot render: output {} not found", oi.name);
+            return Ok(());
+        };
+        let output = &self.outputs[idx];
         if !output.configured {
             tracing::error!("output needs to be configured before rendered");
-            return Ok(())
+            return Ok(());
         }
-        buffer.attach_to(output.layer.wl_surface())?;
-        output.layer.wl_surface().damage_buffer(0, 0, output.width, output.height);
+        let Some(surf) = output.surface.as_ref() else {
+            return Ok(());
+        };
+        let Some(config) = output.surface_config.as_ref() else {
+            return Ok(());
+        };
+        let Some(state) = output.render.as_ref() else {
+            tracing::error!("Cannot render: no render state for output {}", oi.name);
+            return Ok(());
+        };
+
+        gpu.update_uniform(state, &params, progress, oi.width as u32, oi.height as u32);
+        // Request the next callback before presenting: the present commits
+        // the surface and arms the callback.
         if render_next {
             output.layer.wl_surface().frame(&self.qh, output.layer.wl_surface().clone());
         }
-        output.layer.commit();
+        if let Err(err) = gpu.present_frame(surf, state, config) {
+            tracing::error!("Failed to present frame for output {}: {err}", oi.name);
+            return Ok(());
+        }
+        if progress >= 1.0 {
+            // Transition complete: the swapchain keeps showing the final
+            // frame, so drop the render state (two full-resolution
+            // textures per monitor) instead of holding it in the idle
+            // daemon. The next wallpaper change re-uploads anyway.
+            self.outputs[idx].render = None;
+        }
         Ok(())
     }
 
@@ -126,12 +194,6 @@ impl WpdmLayerIO {
     fn get_output_by_surface(&self, surface: &WlSurface) -> Option<&WpdmOutput> {
         self.outputs
             .iter()
-            .find(|out| out.layer.wl_surface() == surface)
-    }
-
-    fn get_output_by_surface_mut(&mut self, surface: &WlSurface) -> Option<&mut WpdmOutput> {
-        self.outputs
-            .iter_mut()
             .find(|out| out.layer.wl_surface() == surface)
     }
 
@@ -169,16 +231,9 @@ impl CompositorHandler for WpdmLayerIO {
             tracing::error!("LOST_FRAME: Cannot render frame on uninitialized output");
             return;
         };
-        let slot = match SlotPool::new(1, &self.shm) {
-            Ok(pool) => pool,
-            Err(err) => {
-                tracing::error!("LOST_FRAME: Cannot create slot pool: {err}");
-                return;
-            },
-        };
 
         self.io_queue
-            .push_back(WpdmIoEvent::Render(WpdmIoRenderEvent { oi: output.to_oi(), slot }));
+            .push_back(WpdmIoEvent::Render(WpdmIoRenderEvent { oi: output.to_oi() }));
     }
 
     fn scale_factor_changed(
@@ -251,12 +306,32 @@ impl OutputHandler for WpdmLayerIO {
         layer.set_size(output_info.width as u32, output_info.height as u32);
         layer.commit();
 
+        let raw_display_handle = RawDisplayHandle::Wayland(WaylandDisplayHandle::new(
+            NonNull::new(self.conn.backend().display_ptr() as *mut _).unwrap(),
+        ));
+
+        let raw_window_handle = RawWindowHandle::Wayland(WaylandWindowHandle::new(
+            NonNull::new(layer.wl_surface().id().as_ptr() as *mut _).unwrap(),
+        ));
+
+        let surface = unsafe {
+            self.gpu_context.instance
+                .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                    raw_display_handle: Some(raw_display_handle),
+                    raw_window_handle,
+                })
+                .unwrap()
+        };
+
         let output = WpdmOutput {
             name: output_info.name.clone(),
             width: output_info.width,
             height: output_info.height,
             layer,
             configured: false,
+            surface: Some(surface),
+            surface_config: None,
+            render: None
         };
 
         let oi = output.to_oi();
@@ -302,7 +377,10 @@ impl LayerShellHandler for WpdmLayerIO {
         _serial: u32,
     ) {
 
-        let output = self.get_output_by_surface_mut(layer.wl_surface());
+        let output = self.outputs
+            .iter_mut()
+            .find(|out| out.layer.wl_surface() == layer.wl_surface());
+
         let Some(output) = output else {
             return;
         };
@@ -311,7 +389,25 @@ impl LayerShellHandler for WpdmLayerIO {
         }
         output.configured = true;
         let oi = output.to_oi();
-        self.io_queue.push_back(WpdmIoEvent::ConfigureOutput(WpdmIoOutputEvent { oi }))
+        if let Some(surf) = output.surface.as_ref() {
+            let surface_config = wgpu::SurfaceConfiguration {
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                format: wgpu::TextureFormat::Bgra8Unorm,
+                view_formats: vec![wgpu::TextureFormat::Bgra8Unorm],
+                alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+                width: oi.width as u32,
+                height: oi.height as u32,
+                desired_maximum_frame_latency: 2,
+                present_mode: wgpu::PresentMode::Mailbox,
+                color_space: wgpu::SurfaceColorSpace::Auto
+            };
+            // Keep the config around so the render path can recover from an
+            // outdated surface by reconfiguring it.
+            output.surface_config = Some(surface_config.clone());
+            surf.configure(&self.gpu_context.device, &surface_config);
+        };
+
+        self.io_queue.push_back(WpdmIoEvent::ConfigureOutput(WpdmIoOutputEvent { oi }));
     }
 }
 
@@ -420,12 +516,6 @@ impl PointerHandler for WpdmLayerIO {
     }
 }
 
-impl ShmHandler for WpdmLayerIO {
-    fn shm_state(&mut self) -> &mut Shm {
-        &mut self.shm
-    }
-}
-
 impl ProvidesRegistryState for WpdmLayerIO {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
@@ -438,6 +528,5 @@ delegate_output!(WpdmLayerIO);
 delegate_seat!(WpdmLayerIO);
 delegate_keyboard!(WpdmLayerIO);
 delegate_pointer!(WpdmLayerIO);
-delegate_shm!(WpdmLayerIO);
 delegate_layer!(WpdmLayerIO);
 delegate_registry!(WpdmLayerIO);

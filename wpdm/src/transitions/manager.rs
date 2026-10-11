@@ -1,13 +1,9 @@
-use memmap2::Mmap;
-
-use crate::transitions::anim::TransitionAnim;
+use crate::io::event::TransitionParams;
 
 pub struct Transition {
     pub monitor: String,
     pub frame: u32,
-    pub from_buffer: Mmap,
-    pub to_buffer: Mmap,
-    pub transition: TransitionAnim,
+    pub params: TransitionParams
 }
 
 pub struct TransitionManager {
@@ -21,7 +17,13 @@ impl TransitionManager {
         }
     }
 
-    pub fn render_transition(&mut self, monitor: &str, buffer: &mut [u8]) -> Option<()> {
+    /// Advance the transition for `monitor` by one frame, synchronized to
+    /// the global minimum frame across all active transitions so monitors
+    /// stay in lockstep and complete together. Returns the params and
+    /// progress to render this frame; the final call returns progress 1.0
+    /// and removes the transition. Returns None when no transition is
+    /// running for this monitor.
+    pub fn advance(&mut self, monitor: &str) -> Option<(TransitionParams, f32)> {
         let tr_idx = self
             .transitions
             .iter()
@@ -31,21 +33,21 @@ impl TransitionManager {
         let frame = self.transitions.iter().map(|tr| tr.frame).min()?;
         let tr = self.transitions.get_mut(tr_idx)?;
 
-        let ret = tr
-            .transition
-            .render(frame, &tr.from_buffer, &tr.to_buffer, buffer);
-        if !ret {
-            tr.frame = frame + 1;
+        let done = frame >= tr.params.n_frames;
+        let progress = if done {
+            1.0
         } else {
-            let Transition {
-                from_buffer,
-                to_buffer,
-                ..
-            } = self.transitions.remove(tr_idx);
-            drop(from_buffer);
-            drop(to_buffer);
+            frame as f32 / tr.params.n_frames as f32
+        };
+        let params = tr.params;
+
+        if done {
+            self.transitions.remove(tr_idx);
+        } else {
+            tr.frame = frame + 1;
         }
-        Some(())
+
+        Some((params, progress))
     }
 
     pub fn has_transitions(&self) -> bool {
