@@ -39,7 +39,10 @@ pub enum WpdmIoRequest {
 #[derive(Debug)]
 pub struct StartTransitionReq {
     pub oi: WpdmOutputInfo,
+    /// Source image path for the previous wallpaper (decode target); None
+    /// for first renders and same-image changes (hard cut).
     pub from: Option<PathBuf>,
+    /// Source image path for the new wallpaper (decode target).
     pub to: PathBuf,
     pub anim: TransitionParams
 }

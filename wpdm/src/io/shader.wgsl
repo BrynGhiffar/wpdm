@@ -37,14 +37,14 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-	let to_color = textureSample(to_tex, tex_sampler, in.uv);
+	let to_color = textureSample(to_tex, tex_sampler, cover_uv(in.uv, to_tex));
 
 	// Hard cut: no effect, or nothing to blend with.
 	if (u.effect == 0u || u.has_from == 0u) {
 		return to_color;
 	}
 
-	let from_color = textureSample(from_tex, tex_sampler, in.uv);
+	let from_color = textureSample(from_tex, tex_sampler, cover_uv(in.uv, from_tex));
 
 	// Framebuffer pixel coordinates: top-left origin, y-down — the same
 	// convention the transition origins use.
@@ -80,4 +80,21 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
 	// mask 1 → `to` (revealed), 0 → `from`.
 	return mix(from_color, to_color, mask);
+}
+
+/// Map a screen uv in [0,1] into the center crop window of `tex` such that
+/// the texture covers the resolution without distortion: the crop + resize
+/// the -cli used to perform at cache time, done per sample instead.
+fn cover_uv(uv: vec2<f32>, tex: texture_2d<f32>) -> vec2<f32> {
+	let size = vec2<f32>(textureDimensions(tex));
+
+	// Image wider than the monitor's aspect ratio → crop horizontally,
+	// taller → crop vertically (matches the cli's get_crop_params).
+	if (size.x * u.resolution.y >= u.resolution.x * size.y) {
+		let tw = u.resolution.x * size.y / (u.resolution.y * size.x);
+		return (uv - vec2<f32>(0.5)) * vec2<f32>(tw, 1.0) + vec2<f32>(0.5);
+	} else {
+		let th = u.resolution.y * size.x / (u.resolution.x * size.y);
+		return (uv - vec2<f32>(0.5)) * vec2<f32>(1.0, th) + vec2<f32>(0.5);
+	}
 }
