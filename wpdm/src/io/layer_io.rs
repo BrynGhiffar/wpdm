@@ -3,7 +3,7 @@ use std::{collections::VecDeque, ptr::NonNull};
 use anyhow::Context;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle};
 use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState}, delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer, delegate_registry, delegate_seat, output::{OutputHandler, OutputState}, registry::{ProvidesRegistryState, RegistryState}, registry_handlers, seat::{Capability, SeatHandler, SeatState, keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers}, pointer::{PointerEvent, PointerHandler}}, shell::{WaylandSurface, wlr_layer::{Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure}}
+    compositor::{CompositorHandler, CompositorState}, delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer, delegate_registry, delegate_seat, output::{OutputHandler, OutputState}, registry::{ProvidesRegistryState, RegistryState}, registry_handlers, seat::{Capability, SeatHandler, SeatState, keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers}, pointer::{PointerEvent, PointerEventKind, PointerHandler}}, shell::{WaylandSurface, wlr_layer::{Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure}}
 };
 
 use wayland_client::{
@@ -11,7 +11,14 @@ use wayland_client::{
 };
 use wpdm_common::{TransitionType, WpdmMonitor, WpdmMonitors};
 
-use crate::{io::{event::{StartTransitionReq, WpdmIoEvent, WpdmIoOutputEvent, WpdmIoRenderEvent, WpdmIoRenderRequest, WpdmOutputInfo}, gpu::{GpuContext, RenderState}}};
+use crate::{
+    decode::decode_bgra,
+    io::{
+        event::{StartTransitionReq, WpdmIoEvent, WpdmIoOutputEvent, WpdmIoRenderEvent, WpdmIoRenderRequest, WpdmOutputInfo},
+        fluid::{SimState, Splat},
+        gpu::{GpuContext, RenderState}
+    }
+};
 
 
 #[derive(Debug)]
@@ -25,7 +32,8 @@ pub struct WpdmOutput {
     pub width: i32,
     pub height: i32,
     pub configured: bool,
-    pub render: Option<RenderState>
+    pub render: Option<RenderState>,
+    pub sim: Option<SimState>
 }
 
 impl WpdmOutput {
@@ -44,7 +52,9 @@ pub struct WpdmLayerIO {
     pub qh: QueueHandle<Self>,
     pub outputs: Vec<WpdmOutput>,
     pub io_queue: VecDeque<WpdmIoEvent>,
-    pub gpu_context: GpuContext
+    pub gpu_context: GpuContext,
+    /// Last surface-local position per pointer, for splat deltas.
+    pointer_prev: Vec<(WlPointer, (f64, f64))>
 }
 
 impl WpdmLayerIO {
@@ -69,7 +79,8 @@ impl WpdmLayerIO {
             qh,
             outputs: vec![],
             io_queue: VecDeque::new(),
-            gpu_context
+            gpu_context,
+            pointer_prev: vec![]
         }, event_queue))
     }
 
@@ -77,14 +88,24 @@ impl WpdmLayerIO {
         oi,
         from,
         to,
-        anim
+        anim,
+        sim
     }: StartTransitionReq) -> anyhow::Result<()> {
         let gpu = &self.gpu_context;
         let Some(idx) = self.outputs.iter().position(|out| out.name == oi.name) else {
             tracing::error!("Cannot start transition: output {} not found", oi.name);
             return Ok(());
         };
-        let output = &self.outputs[idx];
+
+        let (pixels, width, height) = match decode_bgra(&to) {
+            Ok(result) => result,
+            Err(err) => {
+                tracing::error!("Failed to decode wallpaper {to:?}: {err}");
+                return Ok(());
+            }
+        };
+
+        let output = self.outputs.get_mut(idx).unwrap();
         if !output.configured {
             tracing::error!("Cannot start transition on unconfigured output {}", oi.name);
             return Ok(());
@@ -93,6 +114,48 @@ impl WpdmLayerIO {
             tracing::error!("Cannot start transition: no wgpu surface for output {}", oi.name);
             return Ok(());
         };
+        let Some(config) = output.surface_config.as_ref() else {
+            tracing::error!("Cannot start transition: no surface config for output {}", oi.name);
+            return Ok(());
+        };
+
+        if sim {
+            // Fluid sim mode: the sim drives every presented frame and
+            // transitions are hard cuts; the animated mask would need a
+            // second wallpaper composite, so we decline it for now.
+            if !matches!(anim.tran_type, TransitionType::None) {
+                tracing::warn!("sim mode runs hard cuts; ignoring transition type for output {}", oi.name);
+            }
+
+            let sim_state = output.sim.get_or_insert_with(|| {
+                tracing::info!("Initializing fluid sim on output {}", oi.name);
+                SimState::new(gpu, (oi.width as u32, oi.height as u32))
+            });
+            if let Err(err) = sim_state.set_wallpaper(gpu, &pixels, width, height) {
+                tracing::error!("Failed to upload wallpaper on output {}: {err}", oi.name);
+                return Ok(());
+            }
+
+            // Arm the loop: the frame request must precede the commit, and
+            // the present inside render_frame is the commit that arms it.
+            let wls = output.layer.wl_surface();
+            wls.frame(&self.qh, wls.clone());
+            sim_state.wake();
+
+            if let Err(err) = sim_state.render_frame(gpu, surf, config) {
+                tracing::error!("Failed to render sim frame on output {}: {err}", oi.name);
+                return Ok(());
+            }
+            tracing::info!("Sim wallpaper set on output {}", oi.name);
+            return Ok(());
+        }
+
+        // Static path: tear the fluid sim down if it was running (the
+        // fields and wallpaper texture free back once the pending loop
+        // callback — if any — has been consumed).
+        if output.sim.take().is_some() {
+            tracing::info!("Stopping fluid sim on output {}", oi.name);
+        }
 
         let state = match gpu.create_render_state(oi.width as u32, oi.height as u32, from.as_deref(), &to, &anim) {
             Ok(state) => state,
@@ -102,15 +165,13 @@ impl WpdmLayerIO {
             }
         };
         let animated = !matches!(anim.tran_type, TransitionType::None);
+
         // For animated transitions, request the first frame callback before
         // presenting: the present commits the surface and arms the callback.
         if animated {
             output.layer.wl_surface().frame(&self.qh, output.layer.wl_surface().clone());
         }
-        let Some(config) = output.surface_config.as_ref() else {
-            tracing::error!("Cannot start transition: no surface config for output {}", oi.name);
-            return Ok(());
-        };
+
         if let Err(err) = gpu.present_frame(surf, &state, config) {
             tracing::error!("Failed to present frame for output {}: {err}", oi.name);
             return Ok(());
@@ -176,7 +237,7 @@ impl WpdmLayerIO {
     pub fn monitor_query(&self) -> WpdmMonitors {
         let monitors = self.outputs
             .iter()
-            .map(|out| WpdmMonitor { 
+            .map(|out| WpdmMonitor {
                 name: out.name.to_string(),
                 width: out.width,
                 height: out.height
@@ -184,17 +245,10 @@ impl WpdmLayerIO {
         WpdmMonitors { monitors }
     }
 
-
     pub fn get_output_by_name(&self, name: &str) -> Option<&WpdmOutput> {
         self.outputs
             .iter()
             .find(|out| out.name == name)
-    }
-
-    fn get_output_by_surface(&self, surface: &WlSurface) -> Option<&WpdmOutput> {
-        self.outputs
-            .iter()
-            .find(|out| out.layer.wl_surface() == surface)
     }
 
     fn extract_output_info(&self, output: &WlOutput) -> anyhow::Result<WpdmOutputInfo> {
@@ -222,15 +276,36 @@ impl CompositorHandler for WpdmLayerIO {
     fn frame(
         &mut self,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         surface: &WlSurface,
         _time: u32,
     ) {
-        let output = self.get_output_by_surface(surface);
-        let Some(output) = output else {
+        let Some(idx) = self.outputs.iter().position(|out| out.layer.wl_surface() == surface) else {
             tracing::error!("LOST_FRAME: Cannot render frame on uninitialized output");
             return;
         };
+        let output = &mut self.outputs[idx];
+
+        // Fluid sim outputs render inline: splats + pass chain + composite,
+        // all in one encoder, then present. The previous frame requested
+        // the callback; when the sim settles it stops requesting and the
+        // loop ends here.
+        if let Some(sim) = output.sim.as_mut() {
+            if sim.active() {
+                let wls = output.layer.wl_surface();
+                wls.frame(qh, wls.clone());
+            }
+            let Some(surf) = output.surface.as_ref() else {
+                return;
+            };
+            let Some(config) = output.surface_config.as_ref() else {
+                return;
+            };
+            if let Err(err) = sim.render_frame(&self.gpu_context, surf, config) {
+                tracing::error!("sim frame failed on {}: {err}", output.name);
+            }
+            return;
+        }
 
         self.io_queue
             .push_back(WpdmIoEvent::Render(WpdmIoRenderEvent { oi: output.to_oi() }));
@@ -331,7 +406,8 @@ impl OutputHandler for WpdmLayerIO {
             configured: false,
             surface: Some(surface),
             surface_config: None,
-            render: None
+            render: None,
+            sim: None
         };
 
         let oi = output.to_oi();
@@ -366,7 +442,9 @@ impl OutputHandler for WpdmLayerIO {
 }
 
 impl LayerShellHandler for WpdmLayerIO {
-    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _layer: &LayerSurface) {}
+    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _layer: &LayerSurface) {
+        tracing::info!("LAYER CLOSED");
+    }
 
     fn configure(
         &mut self,
@@ -376,12 +454,9 @@ impl LayerShellHandler for WpdmLayerIO {
         _configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
-
-        let output = self.outputs
+        let Some(output) = self.outputs
             .iter_mut()
-            .find(|out| out.layer.wl_surface() == layer.wl_surface());
-
-        let Some(output) = output else {
+            .find(|out| out.layer.wl_surface() == layer.wl_surface()) else {
             return;
         };
         if output.configured {
@@ -397,8 +472,11 @@ impl LayerShellHandler for WpdmLayerIO {
                 alpha_mode: wgpu::CompositeAlphaMode::Opaque,
                 width: oi.width as u32,
                 height: oi.height as u32,
-                desired_maximum_frame_latency: 2,
-                present_mode: wgpu::PresentMode::Mailbox,
+                // Fifo + latency 1: one full-resolution buffer less than
+                // Mailbox, worth 30 MB+ per 4K output. Frame pacing comes
+                // from wl_surface.frame callbacks anyway.
+                desired_maximum_frame_latency: 1,
+                present_mode: wgpu::PresentMode::Fifo,
                 color_space: wgpu::SurfaceColorSpace::Auto
             };
             // Keep the config around so the render path can recover from an
@@ -420,23 +498,37 @@ impl SeatHandler for WpdmLayerIO {
 
     fn new_capability(
         &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: WlSeat,
-        _: Capability,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: WlSeat,
+        capability: Capability,
     ) {
+        // PROBE (fluid sim, phase 0): bind the pointer so the compositor can
+        // deliver pointer focus to our surfaces. Whether background layer
+        // surfaces actually receive it is what this probe is for; the
+        // validated answer feeds the fluid sim (phase 1) below.
+        if matches!(capability, Capability::Pointer) {
+            match self.seat_state.get_pointer(qh, &seat) {
+                Ok(_) => tracing::info!("PROBE pointer: bound pointer"),
+                Err(err) => tracing::error!("PROBE pointer: failed to bind pointer: {err}"),
+            }
+        }
     }
 
     fn remove_capability(
         &mut self,
         _conn: &Connection,
-        _: &QueueHandle<Self>,
-        _: WlSeat,
-        _: Capability,
+        qh: &QueueHandle<Self>,
+        seat: WlSeat,
+        capability: Capability,
     ) {
+        // PROBE (fluid sim, phase 0): re-bind on capability reappearing.
+        if matches!(capability, Capability::Pointer) {
+            let _ = self.seat_state.get_pointer(qh, &seat);
+        }
     }
 
-    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlSeat) {}
+    fn remove_seat(&mut self, _conn: &Connection, _: &QueueHandle<Self>, _: WlSeat) {}
 }
 
 impl KeyboardHandler for WpdmLayerIO {
@@ -509,10 +601,78 @@ impl PointerHandler for WpdmLayerIO {
     fn pointer_frame(
         &mut self,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _pointer: &WlPointer,
-        _events: &[PointerEvent],
+        qh: &QueueHandle<Self>,
+        pointer: &WlPointer,
+        events: &[PointerEvent],
     ) {
+        // Fluid sim: pointer motion becomes velocity + offset splats on the
+        // sim-enabled output the pointer is over. The probe logging from
+        // phase 0 is kept at debug level.
+        for event in events {
+            let Some(idx) = self.outputs.iter().position(|out| out.layer.wl_surface() == &event.surface) else {
+                continue;
+            };
+            let output = &self.outputs[idx];
+            match &event.kind {
+                PointerEventKind::Enter { .. } => {
+                    tracing::info!("PROBE pointer: enter on {}", output.name);
+                    self.pointer_prev.retain(|(p, _)| p != pointer);
+                    self.pointer_prev.push((pointer.clone(), event.position));
+                }
+                PointerEventKind::Leave { .. } => {
+                    tracing::info!("PROBE pointer: leave on {}", output.name);
+                    self.pointer_prev.retain(|(p, _)| p != pointer);
+                }
+                PointerEventKind::Motion { .. } => {
+                    tracing::debug!(
+                        "PROBE pointer: motion on {} at ({:.0}, {:.0})",
+                        output.name,
+                        event.position.0,
+                        event.position.1
+                    );
+                    let position = event.position;
+                    let delta = match self.pointer_prev.iter_mut().find(|(p, _)| p == pointer) {
+                        Some(prev) => {
+                            let d = (position.0 - prev.1 .0, position.1 - prev.1 .1);
+                            prev.1 = position;
+                            Some(d)
+                        }
+                        None => {
+                            self.pointer_prev.push((pointer.clone(), position));
+                            None
+                        }
+                    };
+                    let Some((dx, dy)) = delta else { continue };
+                    if (dx, dy) == (0.0, 0.0) {
+                        continue;
+                    }
+                    // Local copies so the immutable borrow of `output` ends
+                    // before we take the mutable borrow of the sim.
+                    let wls = output.layer.wl_surface().clone();
+                    let (w, h) = (output.width, output.height);
+                    if let Some(sim) = self.outputs[idx].sim.as_mut() {
+                        if sim.is_sleeping() {
+                            // Wake the sim: request the callback + an empty
+                            // commit to arm it; render_frame does the presents.
+                            wls.frame(qh, wls.clone());
+                            wls.commit();
+                            sim.wake();
+                        }
+                        let uv = [
+                            (position.0 as f32 / w as f32).clamp(0.0, 1.0),
+                            (position.1 as f32 / h as f32).clamp(0.0, 1.0),
+                        ];
+                        sim.push_splat(Splat {
+                            pos: uv,
+                            dxy: [dx as f32, dy as f32],
+                        });
+                    }
+                }
+                other => {
+                    tracing::info!("PROBE pointer: {other:?} on {}", output.name);
+                }
+            }
+        }
     }
 }
 

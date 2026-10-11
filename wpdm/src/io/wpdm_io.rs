@@ -56,7 +56,7 @@ impl WpdmIo {
         self.layer_evq.dispatch_pending(&mut self.layer_io)?;
 
         if let Some(guard) = self.layer_evq.prepare_read() {
-            tracing::info!("Polling...");
+            // tracing::info!("Polling...");
             loop {
                 match self.poll.poll(&mut self.events, None) {
                     Ok(()) => break,
@@ -67,7 +67,7 @@ impl WpdmIo {
                     Err(e) => return Err(e.into())
                 }
             }
-            tracing::info!("Received some events...");
+            // tracing::info!("Received some events...");
 
             if self.events.iter().any(|e| e.token() == LAYER_TOKEN) {
                 match guard.read() {
@@ -82,8 +82,14 @@ impl WpdmIo {
             }
 
             if self.events.iter().any(|e| e.token() == UDP_TOKEN) {
-                let req = self.listener.recv()?;
-                res.push(WpdmIoEvent::CliRequest(req));
+                // A malformed or version-skewed packet must not take the
+                // daemon down — log and keep listening.
+                match self.listener.recv() {
+                    Ok(req) => res.push(WpdmIoEvent::CliRequest(req)),
+                    Err(err) => {
+                        tracing::error!("Ignoring undecodable CLI packet: {err}");
+                    }
+                }
             }
         }
         self.pop_layer_io_evt(&mut res);

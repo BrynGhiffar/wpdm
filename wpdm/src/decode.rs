@@ -5,8 +5,11 @@ use image::DynamicImage;
 
 /// wgpu's default `max_texture_dimension_2d`.
 const MAX_TEXTURE_DIM: u32 = 8192;
-/// Transient texture budget; larger decodes are pre-scaled to fit.
-const MAX_TEXTURE_BYTES: u64 = 128 * 1024 * 1024;
+/// Transient texture budget; larger decodes are pre-scaled to fit. One 4K
+/// BGRA frame is ~32 MB — beyond that the GPU composite downsizes anyway,
+/// and the budget bounds the staging allocation `write_texture` makes
+/// (the allocator retains it after the upload).
+const MAX_TEXTURE_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Decode a source image into BGRA bytes at native resolution (no resize:
 /// the GPU scales and crops at draw time), capped to the texture budget.

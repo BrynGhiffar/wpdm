@@ -39,12 +39,15 @@ pub enum WpdmIoRequest {
 #[derive(Debug)]
 pub struct StartTransitionReq {
     pub oi: WpdmOutputInfo,
-    /// Source image path for the previous wallpaper (decode target); None
-    /// for first renders and same-image changes (hard cut).
+    /// Source image path for the previous wallpaper; the static render
+    /// path uses it for animated transitions, the fluid sim ignores it.
     pub from: Option<PathBuf>,
     /// Source image path for the new wallpaper (decode target).
     pub to: PathBuf,
-    pub anim: TransitionParams
+    pub anim: TransitionParams,
+    /// Fluid-sim mode for this change: the sim replaces the static
+    /// renderer per output until a non-sim command arrives.
+    pub sim: bool
 }
 
 /// Transition parameters resolved for the shader: origin in screen pixel
