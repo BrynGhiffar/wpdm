@@ -29,6 +29,10 @@ pub struct WallpaperCmd {
     pub tran_type: TransitionType,
     pub tran_origin: TransitionOrigin,
     pub angle: f32,
+    /// Fluid-sim mode for this command. Daemon and cli version together
+    /// (postcard is positional; there is no cross-version wire compat).
+    #[serde(default)]
+    pub sim: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]

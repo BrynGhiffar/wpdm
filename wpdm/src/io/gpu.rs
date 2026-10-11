@@ -26,6 +26,21 @@ pub struct RenderState {
     pub has_from: u32
 }
 
+/// The fluid-sim pass pipelines: one render pipeline per pass entry of
+/// `fluid.wgsl`, all sharing the sim bind group layout. The composite pass
+/// targets the surface format; every other pass targets Rgba16Float fields.
+pub struct SimPipelines {
+    pub curl: RenderPipeline,
+    pub vorticity: RenderPipeline,
+    pub divergence: RenderPipeline,
+    pub bias: RenderPipeline,
+    pub jacobi: RenderPipeline,
+    pub gradient: RenderPipeline,
+    pub advect: RenderPipeline,
+    pub splat: RenderPipeline,
+    pub composite: RenderPipeline,
+}
+
 pub struct GpuContext {
     pub instance: Instance,
     adapter: Adapter,
@@ -34,7 +49,9 @@ pub struct GpuContext {
     pub render_pipeline: RenderPipeline,
     pub bind_group_layout: BindGroupLayout,
     pub sampler: Sampler,
-    pub dummy_view: TextureView
+    pub dummy_view: TextureView,
+    pub sim_bind_group_layout: BindGroupLayout,
+    pub sim_pipelines: SimPipelines
 }
 // clippy::new_ret_no_self
 impl GpuContext {
@@ -43,8 +60,23 @@ impl GpuContext {
         let adapter = Self::new_adapter(&instance)?;
         let info = adapter.get_info();
         tracing::info!("Using GPU adapter: {} ({:?}, driver: {})", info.name, info.device_type, info.driver);
+
+        // PROBE (fluid sim, phase 0): the sim fields live on rgba16float
+        // render targets sampled with linear filtering — both must be
+        // available, so the failure is loud at startup instead of sim time.
+        let features = adapter.get_texture_format_features(wgpu::TextureFormat::Rgba16Float);
+        anyhow::ensure!(
+            features.allowed_usages.contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+                && features.flags.contains(wgpu::TextureFormatFeatureFlags::FILTERABLE),
+            "PROBE rgba16float: not renderable+filterable on this adapter; the fluid sim will not work here"
+        );
+        tracing::info!("PROBE rgba16float: renderable + filterable ✓");
+
         let (device, queue) = pollster::block_on(
             adapter.request_device(&wgpu::DeviceDescriptor {
+                // Bandwidth-frugal allocator policy: free retained blocks
+                // (e.g. staging buffers after uploads) instead of caching.
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
                 ..Default::default()
             }))?;
         // wgpu errors are fatal by default: log them instead, so one bad
@@ -151,6 +183,114 @@ impl GpuContext {
             ..Default::default()
         });
 
+        // Fluid sim pipelines: shared bind group layout (dynamic uniform +
+        // linear sampler + two float textures), one pipeline per pass
+        // entry; the composite pass targets the surface format instead.
+        let sim_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("sim_bind_group_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: Some(NonZero::new(64).unwrap()),
+                    },
+                    count: None
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false
+                    },
+                    count: None
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false
+                    },
+                    count: None
+                }
+            ]
+        });
+        let sim_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("sim_pipeline_layout"),
+            bind_group_layouts: &[Some(&sim_bind_group_layout)],
+            immediate_size: 0,
+        });
+        let sim_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fluid_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("fluid.wgsl").into())
+        });
+        let make_sim_pipeline = |name: &'static str, format: wgpu::TextureFormat, entry: &'static str| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(name),
+                layout: Some(&sim_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &sim_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default()
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &sim_shader,
+                    entry_point: Some(entry),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false
+                },
+                multiview_mask: None,
+                cache: None
+            })
+        };
+        // Target formats must match the fields each pass writes into:
+        // rgba->sub-rgba split means curl/divergence/bias/jacobi write
+        // R16Float, vorticity/gradient/advect/splat write Rg16Float, and
+        // the composite targets the surface format.
+        let sim_pipelines = SimPipelines {
+            curl: make_sim_pipeline("sim_curl", wgpu::TextureFormat::R16Float, "fs_curl"),
+            vorticity: make_sim_pipeline("sim_vorticity", wgpu::TextureFormat::Rg16Float, "fs_vorticity"),
+            divergence: make_sim_pipeline("sim_divergence", wgpu::TextureFormat::R16Float, "fs_divergence"),
+            bias: make_sim_pipeline("sim_bias", wgpu::TextureFormat::R16Float, "fs_pressure_bias"),
+            jacobi: make_sim_pipeline("sim_jacobi", wgpu::TextureFormat::R16Float, "fs_jacobi"),
+            gradient: make_sim_pipeline("sim_gradient", wgpu::TextureFormat::Rg16Float, "fs_gradient_subtract"),
+            advect: make_sim_pipeline("sim_advect", wgpu::TextureFormat::Rg16Float, "fs_advect"),
+            splat: make_sim_pipeline("sim_splat", wgpu::TextureFormat::Rg16Float, "fs_splat"),
+            composite: make_sim_pipeline("sim_composite", wgpu::TextureFormat::Bgra8Unorm, "fs_composite"),
+        };
+
         let dummy_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("dummy_from"),
             size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
@@ -178,7 +318,7 @@ impl GpuContext {
         );
         let dummy_view = dummy_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        Ok(Self { instance, adapter, device, queue, render_pipeline, bind_group_layout, sampler, dummy_view })
+        Ok(Self { instance, adapter, device, queue, render_pipeline, bind_group_layout, sampler, dummy_view, sim_bind_group_layout, sim_pipelines })
     }
 
     fn new_instance() -> wgpu::Instance {

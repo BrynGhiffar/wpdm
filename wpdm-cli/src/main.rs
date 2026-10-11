@@ -52,6 +52,9 @@ struct Args {
     origin: ArgTransitionOrigin,
     #[arg(short, long, default_value_t = 30.0)]
     angle: f32,
+    /// Run the fluid sim for this wallpaper instead of a static render.
+    #[arg(long, short = 'f')]
+    sim: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -82,7 +85,8 @@ fn main() -> anyhow::Result<()> {
         monitors: names,
         tran_origin,
         tran_type,
-        angle: args.angle
+        angle: args.angle,
+        sim: args.sim
     }))?;
 
     Ok(())

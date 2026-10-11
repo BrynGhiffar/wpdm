@@ -90,7 +90,8 @@ impl WpdmApp {
             oi,
             from: None,
             to: path,
-            anim
+            anim,
+            sim: false
         })]
     }
 
@@ -132,7 +133,10 @@ impl WpdmApp {
                 oi.width as u32,
                 oi.height as u32
             );
-            if !matches!(anim.tran_type, TransitionType::None) {
+            // Animated transitions are useless in sim mode (the renderer
+            // declines them), so only queue manager entries for the static
+            // path.
+            if !cmd.sim && !matches!(anim.tran_type, TransitionType::None) {
                 self.trm.transitions.push(Transition {
                     frame: 0,
                     monitor: name.clone(),
@@ -144,7 +148,8 @@ impl WpdmApp {
                 oi,
                 from: old_path.filter(|old| old != &new_path),
                 to: new_path,
-                anim
+                anim,
+                sim: cmd.sim
             }));
         }
         reqs
